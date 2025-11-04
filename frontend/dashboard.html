@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -5,12 +6,31 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dashboard</title>
     <link rel="stylesheet" href="styles.css">
+    <script src="https://d3js.org/d3.v7.min.js"></script>
 </head>
 <body>
     <div class="container">
         <h2>Welcome to your Dashboard</h2>
         <p>You have successfully logged in.</p>
+        
+        <div id="audio-container">
+            <h3>Live Audio Feed</h3>
+            <div id="status-indicators">
+                <span id="recording-status"></span>
+                <span id="processing-status"></span>
+                <span id="silence-status"></span>
+            </div>
+            <div class="waveform-container">
+        <canvas id="waveform" width="800" height="200"></canvas>
+    </div>
+            <div id="rms-meter">
+                <div id="rms-level"></div>
+            </div>
+        </div>
+
         <a href="index.html">Logout</a>
     </div>
+
+    <script src="js/dashboard.js"></script>
 </body>
 </html>

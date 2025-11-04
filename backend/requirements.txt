@@ -13,4 +13,14 @@ psycopg2-binary
 python-multipart
 uvicorn
 fastapi-mail 
+fastapi
+uvicorn
 python-dotenv
+pymysql
+sqlalchemy
+bcrypt
+jose
+pyaudio
+noisereduce
+websockets
+scipy

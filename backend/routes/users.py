@@ -3,9 +3,11 @@ from sqlalchemy.orm import Session
 from datetime import timedelta
 
 from models.users import ResponseSchema, Register, Login
+from models.token import Token
 from tables.users import CareTaker, CareRecipient
 from config import get_db, ACCESS_TOKEN_EXPIRE_MINUTES
 from repository.users import UsersRepo, JWTRepo
+from repository.token_blocklist import TokenBlocklistRepo
 from utils.email import send_registration_email
 
 router = APIRouter(tags=['Authentication'])
@@ -96,3 +98,19 @@ async def login(request: Login, db: Session = Depends(get_db)):
         raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
+
+
+# ---------- LOGOUT ----------
+@router.post('/logout', response_model=ResponseSchema)
+async def logout(request: Token, db: Session = Depends(get_db)):
+    try:
+        if not TokenBlocklistRepo.is_token_blocklisted(db, request.token):
+            TokenBlocklistRepo.add_token_to_blocklist(db, request.token)
+        return ResponseSchema(
+            code=200,
+            status="success",
+            message="Logout successful",
+            result={}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Logout failed: {str(e)}")
