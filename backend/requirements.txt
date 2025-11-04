@@ -24,3 +24,7 @@ pyaudio
 noisereduce
 websockets
 scipy
+
+deepface
+opencv-python
+tf-keras
