@@ -4,6 +4,8 @@ from config import engine
 import tables.users as user_tables
 import routes.users as user_routes
 import routes.audio as audio_routes
+import routes.video as video_routes
+
 
 user_tables.Base.metadata.create_all(bind=engine)
 
@@ -25,6 +27,8 @@ async def root():
 # Include routers without prefix since we're handling it in the router
 app.include_router(user_routes.router)
 app.include_router(audio_routes.router)
+app.include_router(video_routes.router)
+
 
 if __name__ == "__main__":
     import uvicorn
