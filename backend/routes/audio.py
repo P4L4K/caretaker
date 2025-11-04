@@ -78,7 +78,7 @@ def apply_noise_gate_with_hold(audio_data, rms, gate_state, hold_counter,
     
     return gated_audio.astype(np.int16), gate_state, hold_counter
 
-async def audio_stream(websocket: WebSocket):
+async def audio_stream(websocket: WebSocket, token: dict):
     """Capture, process, and stream audio data."""
     p = router.pyaudio_instance
 
@@ -201,9 +201,42 @@ async def audio_stream(websocket: WebSocket):
             wf.close()
             logging.info(f"Audio saved to {WAVE_OUTPUT_FILENAME}")
 
-async def websocket_endpoint(websocket: WebSocket):
+from repository.users import JWTRepo
+from repository.token_blocklist import TokenBlocklistRepo
+from config import get_db
+from sqlalchemy.orm import Session
+from fastapi import Depends, Query
+
+
+async def get_token(
+    websocket: WebSocket,
+    db: Session = Depends(get_db)
+):
+    token = websocket.query_params.get("token")
+    if token is None:
+        raise WebSocketDisconnect(code=403, reason="Token not provided")
+    
+    if TokenBlocklistRepo.is_token_blocklisted(db, token):
+        raise WebSocketDisconnect(code=403, reason="Token has been blocklisted")
+
+    decoded_token = JWTRepo.decode_token(token)
+    if not decoded_token:
+        raise WebSocketDisconnect(code=403, reason="Invalid token")
+    
+    return decoded_token
+
+@router.websocket("/ws/audio")
+async def websocket_endpoint(websocket: WebSocket, db: Session = Depends(get_db)):
     """WebSocket endpoint for audio streaming."""
-    await audio_stream(websocket)
+    try:
+        token = await get_token(websocket, db)
+        await audio_stream(websocket, token)
+    except WebSocketDisconnect as e:
+        logging.info(f"WebSocket disconnected: {e.reason}")
+        # The connection is already closed by FastAPI, but if you need to send a custom message before,
+        # you would do it before the exception is raised.
+        # await websocket.close(code=e.code, reason=e.reason) - This is handled by FastAPI
+        pass
 
 @router.on_event("shutdown")
 async def shutdown_event():
