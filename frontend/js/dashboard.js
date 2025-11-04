@@ -48,7 +48,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function connectWebSocket() {
-        socket = new WebSocket('ws://localhost:8000/ws/audio');
+        const token = localStorage.getItem('token');
+        if (!token) {
+            window.location.href = 'index.html';
+            return;
+        }
+        socket = new WebSocket(`ws://localhost:8000/ws/audio?token=${token}`);
 
         socket.onopen = () => {
             console.log('WebSocket connection established.');
