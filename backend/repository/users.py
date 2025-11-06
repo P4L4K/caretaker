@@ -2,7 +2,7 @@ from typing import List, TypeVar, Generic, Optional
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
-from config import SECRET_KEY, ALGORITHM
+from ..config import SECRET_KEY, ALGORITHM
 
 T = TypeVar('T')
 

@@ -1,10 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from config import engine
-import tables.users as user_tables
-import routes.users as user_routes
-import routes.audio as audio_routes
-import routes.video as video_routes
+from .config import engine
+from .tables import users as user_tables
+from .routes import users as user_routes
+from .routes import audio as audio_routes
+from .routes import video as video_routes
 
 
 user_tables.Base.metadata.create_all(bind=engine)
@@ -33,7 +33,7 @@ app.include_router(video_routes.router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "main:app",
+        "backend.main:app",
         host="0.0.0.0",
         port=8000,
         reload=True,

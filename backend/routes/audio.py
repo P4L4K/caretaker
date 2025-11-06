@@ -46,7 +46,7 @@ def calculate_db(rms):
     return 20 * np.log10(rms / 32768.0)
 
 def apply_noise_gate_with_hold(audio_data, rms, gate_state, hold_counter, 
-                                attack_samples, release_samples, hold_samples):
+                                attack_samples, release_samples, hold_samples, adaptive_threshold):
     """
     Apply noise gate with attack, hold, and release envelope.
     Returns: (gated_audio, new_gate_state, new_hold_counter)
@@ -54,7 +54,8 @@ def apply_noise_gate_with_hold(audio_data, rms, gate_state, hold_counter,
     db_level = calculate_db(rms)
     
     # Determine if gate should be open
-    gate_open = db_level > NOISE_GATE_THRESHOLD and rms > SILENCE_THRESHOLD_RMS
+    # Replace with adaptive threshold
+    gate_open = db_level > NOISE_GATE_THRESHOLD and rms > adaptive_threshold
     
     # Prevent division by zero
     attack_samples = max(1, attack_samples)
@@ -109,7 +110,7 @@ async def audio_stream(websocket: WebSocket, token: dict):
     # Rolling buffer for adaptive noise floor estimation
     noise_floor_buffer = []
     noise_floor_size = 100  # Larger buffer for stable noise floor in care environment
-    MIN_NOISE_THRESHOLD = 200  # Lower baseline for quiet elderly care settings
+    MIN_NOISE_THRESHOLD = 100  # Lower baseline for quiet elderly care settings
     MAX_NOISE_THRESHOLD = 800  # Cap to prevent adaptation to loud events
     
     try:
@@ -143,7 +144,7 @@ async def audio_stream(websocket: WebSocket, token: dict):
                 y=data_np, 
                 sr=RATE, 
                 stationary=True,
-                prop_decrease=0.8  # Less aggressive to preserve weak sounds
+                prop_decrease=0.5  # Less aggressive to preserve weak sounds
             )
             
             # Calculate RMS after noise reduction
@@ -152,7 +153,7 @@ async def audio_stream(websocket: WebSocket, token: dict):
             # Apply noise gate with hold
             gated_audio, gate_state, hold_counter = apply_noise_gate_with_hold(
                 reduced_noise, rms, gate_state, hold_counter,
-                attack_samples, release_samples, hold_samples
+                attack_samples, release_samples, hold_samples, adaptive_threshold
             )
             
             # Log audio levels for debugging (comment out after tuning)
@@ -201,9 +202,9 @@ async def audio_stream(websocket: WebSocket, token: dict):
             wf.close()
             logging.info(f"Audio saved to {WAVE_OUTPUT_FILENAME}")
 
-from repository.users import JWTRepo
-from repository.token_blocklist import TokenBlocklistRepo
-from config import get_db
+from ..repository.users import JWTRepo
+from ..repository.token_blocklist import TokenBlocklistRepo
+from ..config import get_db
 from sqlalchemy.orm import Session
 from fastapi import Depends, Query
 

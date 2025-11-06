@@ -28,3 +28,4 @@ scipy
 deepface
 opencv-python
 tf-keras
+ultralytics

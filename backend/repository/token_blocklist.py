@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from tables.token_blocklist import TokenBlocklist
+from ..tables.token_blocklist import TokenBlocklist
 
 class TokenBlocklistRepo:
     @staticmethod
