@@ -1,3 +1,4 @@
+ 
 import asyncio
 import json
 import logging
@@ -5,8 +6,24 @@ import numpy as np
 import pyaudio
 import noisereduce as nr
 import wave
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request
+import os
+from datetime import datetime
+from pathlib import Path
+import soundfile as sf
+import librosa
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+from keras.models import load_model as keras_load_model
+import joblib
+import pandas as pd
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request, Depends
 from scipy.io.wavfile import write as write_wav
+from sqlalchemy.orm import Session
+from ..tables.users import CareTaker, CareRecipient
+from ..repository.users import UsersRepo
+from ..repository.users import JWTRepo
+from ..repository.token_blocklist import TokenBlocklistRepo
+from ..config import get_db
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,9 +52,34 @@ p = pyaudio.PyAudio()
 
 @router.on_event("startup")
 async def startup_event():
-    # Initialize PyAudio on app startup
     router.pyaudio_instance = pyaudio.PyAudio()
     logging.info("PyAudio instance created.")
+    models_dir = Path("models/audio/cough/models")
+    preproc_dir = Path("models/audio/cough/preprocessor")
+    router.cough_classifier = None
+    try:
+        router.cough_classifier = keras_load_model(str(models_dir / "yamnet_88.keras"))
+    except Exception as e1:
+        try:
+            router.cough_classifier = tf.keras.models.load_model(str(models_dir / "yamnet_88.keras"), compile=False)
+        except Exception as e2:
+            logging.error(f"Failed to load cough classifier: {e1} | {e2}")
+    try:
+        router.yamnet_model = tf.saved_model.load(str(models_dir / "yamnet_88_savedmodel"))
+    except Exception:
+        router.yamnet_model = None
+        logging.error("Failed to load YAMNet saved model.")
+    try:
+        router.preprocessor = joblib.load(str(preproc_dir / "preprocessor_saved.pkl"))
+    except Exception as e:
+        router.preprocessor = None
+        logging.error(f"Failed to load preprocessor: {e}")
+    router.media_dir = Path("media/cough")
+    router.media_dir.mkdir(parents=True, exist_ok=True)
+    router.target_sr = 16000
+    router.target_duration = 4.68
+    router.max_segments = 30
+    router.threshold = 0.5
 
 def calculate_db(rms):
     """Convert RMS to decibels."""
@@ -79,7 +121,7 @@ def apply_noise_gate_with_hold(audio_data, rms, gate_state, hold_counter,
     
     return gated_audio.astype(np.int16), gate_state, hold_counter
 
-async def audio_stream(websocket: WebSocket, token: dict):
+async def audio_stream(websocket: WebSocket, token: dict, db: Session):
     """Capture, process, and stream audio data."""
     p = router.pyaudio_instance
 
@@ -97,6 +139,9 @@ async def audio_stream(websocket: WebSocket, token: dict):
     audio_buffer = []
     gate_state = 0.0  # Gate envelope state (0.0 = closed, 1.0 = open)
     hold_counter = 0  # NEW: Track hold time
+    segment_active = False
+    segment_bytes = []
+    segment_started_at = None
     
     # Calculate timing in samples
     attack_samples = max(1, int(ATTACK_TIME * RATE / CHUNK))
@@ -163,6 +208,10 @@ async def audio_stream(websocket: WebSocket, token: dict):
             # Only save and send if gate is significantly open
             if gate_state > 0.1:
                 audio_buffer.append(gated_audio.tobytes())
+                segment_bytes.append(gated_audio.tobytes())
+                if not segment_active:
+                    segment_active = True
+                    segment_started_at = datetime.utcnow()
                 
                 # Send waveform data to the frontend
                 await websocket.send_text(json.dumps({
@@ -184,6 +233,66 @@ async def audio_stream(websocket: WebSocket, token: dict):
                     "hold_active": False
                 }))
 
+                if segment_active and segment_bytes:
+                    try:
+                        raw_bytes = b"".join(segment_bytes)
+                        segment_active = False
+                        segment_bytes = []
+                        duration_sec = len(raw_bytes) / (2 * RATE)
+                        if duration_sec >= 0.3:
+                            tmp_path = router.media_dir / "_tmp_segment.wav"
+                            data_i16 = np.frombuffer(raw_bytes, dtype=np.int16)
+                            sf.write(str(tmp_path), data_i16.astype(np.int16), RATE, subtype='PCM_16')
+
+                            y, sr = librosa.load(str(tmp_path), sr=None, mono=True)
+                            if sr != router.target_sr:
+                                y = librosa.resample(y, orig_sr=sr, target_sr=router.target_sr)
+                                sr = router.target_sr
+                            y = y / (np.max(np.abs(y)) + 1e-6)
+                            target_length = int(router.target_duration * sr)
+                            if len(y) > target_length:
+                                y = y[:target_length]
+                            elif len(y) < target_length:
+                                y = np.pad(y, (0, target_length - len(y)))
+
+                            if router.yamnet_model is None or router.cough_classifier is None or router.preprocessor is None:
+                                logging.warning("Skipping prediction: model or preprocessor not loaded.")
+                                continue
+
+                            waveform = tf.convert_to_tensor(y, dtype=tf.float32)
+                            _, embeddings, _ = router.yamnet_model(waveform)
+                            embeddings = embeddings.numpy()
+                            if embeddings.shape[0] < router.max_segments:
+                                embeddings = np.pad(embeddings, ((0, router.max_segments - embeddings.shape[0]), (0, 0)), mode='constant')
+                            else:
+                                embeddings = embeddings[:router.max_segments]
+
+                            meta_df = pd.DataFrame([meta_dict])
+                            meta_input = router.preprocessor.transform(meta_df).astype('float32')
+                            pred = router.cough_classifier.predict([embeddings[np.newaxis, :, :], meta_input], verbose=0)
+                            prob = float(pred[0, 0])
+                            label = "Cough" if prob >= router.threshold else "Not Cough"
+
+                            event = {
+                                "event": "prediction",
+                                "timestamp": segment_started_at.isoformat() + "Z",
+                                "probability": prob,
+                                "label": label
+                            }
+
+                            if label == "Cough":
+                                ts = segment_started_at.strftime("%Y%m%dT%H%M%S%fZ")
+                                out_path = router.media_dir / f"cough_{ts}.wav"
+                                sf.write(str(out_path), y, sr, subtype='PCM_16')
+                                event["media_url"] = f"/media/cough/{out_path.name}"
+                                sidecar = {"timestamp": event["timestamp"], "probability": prob, "label": label, "media_url": event["media_url"], "username": username, "caretaker_id": (caretaker.id if caretaker else None), "recipient_id": (recipient.id if recipient else None), "age": meta_dict["age"], "gender": meta_dict["gender"], "respiratory_condition": meta_dict["respiratory_condition"]}
+                                with open(str(out_path.with_suffix('.json')), 'w', encoding='utf-8') as f:
+                                    json.dump(sidecar, f)
+
+                            await websocket.send_text(json.dumps(event))
+                    except Exception as e:
+                        logging.error(f"Segment processing failed: {e}", exc_info=True)
+
     except WebSocketDisconnect:
         logging.info("WebSocket disconnected.")
     except Exception as e:
@@ -201,12 +310,6 @@ async def audio_stream(websocket: WebSocket, token: dict):
             wf.writeframes(b''.join(audio_buffer))
             wf.close()
             logging.info(f"Audio saved to {WAVE_OUTPUT_FILENAME}")
-
-from ..repository.users import JWTRepo
-from ..repository.token_blocklist import TokenBlocklistRepo
-from ..config import get_db
-from sqlalchemy.orm import Session
-from fastapi import Depends, Query
 
 
 async def get_token(
@@ -231,7 +334,7 @@ async def websocket_endpoint(websocket: WebSocket, db: Session = Depends(get_db)
     """WebSocket endpoint for audio streaming."""
     try:
         token = await get_token(websocket, db)
-        await audio_stream(websocket, token)
+        await audio_stream(websocket, token, db)
     except WebSocketDisconnect as e:
         logging.info(f"WebSocket disconnected: {e.reason}")
         # The connection is already closed by FastAPI, but if you need to send a custom message before,
@@ -245,3 +348,18 @@ async def shutdown_event():
     if hasattr(router, 'pyaudio_instance'):
         router.pyaudio_instance.terminate()
         logging.info("PyAudio instance terminated.")
+
+@router.get("/api/cough/detections")
+async def list_cough_detections():
+    items = []
+    try:
+        for j in sorted(router.media_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                with open(j, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    items.append(data)
+            except Exception:
+                pass
+    except Exception:
+        items = []
+    return {"items": items}

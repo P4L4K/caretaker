@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from .config import engine
 from .tables import users as user_tables
 from .routes import users as user_routes
@@ -28,6 +30,12 @@ async def root():
 app.include_router(user_routes.router)
 app.include_router(audio_routes.router)
 app.include_router(video_routes.router)
+
+# Mount static media directory
+media_root = Path("media")
+media_root.mkdir(parents=True, exist_ok=True)
+(media_root / "cough").mkdir(parents=True, exist_ok=True)
+app.mount("/media", StaticFiles(directory=str(media_root)), name="media")
 
 
 if __name__ == "__main__":
