@@ -19,11 +19,11 @@ import pandas as pd
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request, Depends
 from scipy.io.wavfile import write as write_wav
 from sqlalchemy.orm import Session
-from ..tables.users import CareTaker, CareRecipient
-from ..repository.users import UsersRepo
-from ..repository.users import JWTRepo
-from ..repository.token_blocklist import TokenBlocklistRepo
-from ..config import get_db
+from tables.users import CareTaker, CareRecipient
+from repository.users import UsersRepo
+from repository.users import JWTRepo
+from repository.token_blocklist import TokenBlocklistRepo
+from config import get_db
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -54,23 +54,33 @@ p = pyaudio.PyAudio()
 async def startup_event():
     router.pyaudio_instance = pyaudio.PyAudio()
     logging.info("PyAudio instance created.")
-    models_dir = Path("models/audio/cough/models")
-    preproc_dir = Path("models/audio/cough/preprocessor")
+    # Get absolute path to models directory (parent of backend)
+    backend_dir = Path(__file__).parent.parent
+    models_dir = backend_dir.parent / "models" / "audio" / "cough" / "models"
+    preproc_dir = backend_dir.parent / "models" / "audio" / "cough" / "preprocessor"
+    logging.info(f"Loading models from: {models_dir}")
     router.cough_classifier = None
     try:
         router.cough_classifier = keras_load_model(str(models_dir / "yamnet_88.keras"))
+        logging.info("Cough classifier loaded successfully!")
     except Exception as e1:
         try:
             router.cough_classifier = tf.keras.models.load_model(str(models_dir / "yamnet_88.keras"), compile=False)
+            logging.info("Cough classifier loaded successfully (TF method)!")
         except Exception as e2:
             logging.error(f"Failed to load cough classifier: {e1} | {e2}")
+            router.cough_classifier = None
+    # Note: yamnet_88_savedmodel is actually the cough classifier, not raw YAMNet
+    # We'll load actual YAMNet from TensorFlow Hub when needed
     try:
         router.yamnet_model = tf.saved_model.load(str(models_dir / "yamnet_88_savedmodel"))
-    except Exception:
+        logging.info("Cough classifier model loaded successfully (yamnet_88_savedmodel)!")
+    except Exception as e:
         router.yamnet_model = None
-        logging.error("Failed to load YAMNet saved model.")
+        logging.error(f"Failed to load cough classifier model: {e}")
     try:
         router.preprocessor = joblib.load(str(preproc_dir / "preprocessor_saved.pkl"))
+        logging.info("Preprocessor loaded successfully!")
     except Exception as e:
         router.preprocessor = None
         logging.error(f"Failed to load preprocessor: {e}")
@@ -86,6 +96,34 @@ def calculate_db(rms):
     if rms <= 0:
         return -100
     return 20 * np.log10(rms / 32768.0)
+
+def normalize_audio(audio, target_db=-20.0):
+    """
+    Normalize audio to target dB level for consistent ML input.
+    Critical for elderly voices which can be very quiet.
+    
+    Args:
+        audio: numpy array of int16 audio samples
+        target_db: target RMS level in dB (default -20 dB, optimal for speech)
+    
+    Returns:
+        Normalized audio array (int16)
+    """
+    rms = np.sqrt(np.mean(np.square(audio.astype(np.float32))))
+    if rms < 1e-6:
+        return audio
+    
+    current_db = 20 * np.log10(rms / 32768.0)
+    gain_db = target_db - current_db
+    gain_linear = 10 ** (gain_db / 20.0)
+    
+    # Apply gain with clipping prevention
+    normalized = audio.astype(np.float32) * gain_linear
+    normalized = np.clip(normalized, -32768, 32767)
+    
+    logging.info(f"Audio normalization: {current_db:.1f} dB → {target_db:.1f} dB (gain: {gain_db:+.1f} dB)")
+    
+    return normalized.astype(np.int16)
 
 def apply_noise_gate_with_hold(audio_data, rms, gate_state, hold_counter, 
                                 attack_samples, release_samples, hold_samples, adaptive_threshold):
@@ -125,6 +163,24 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
     """Capture, process, and stream audio data."""
     p = router.pyaudio_instance
 
+    # Extract username from token and get user data
+    username = token.get("sub")
+    caretaker = UsersRepo.find_by_username(db, CareTaker, username) if username else None
+    
+    # Get first care recipient for metadata (you may want to make this configurable)
+    recipient = None
+    if caretaker and caretaker.care_recipients:
+        recipient = caretaker.care_recipients[0]
+    
+    # Create metadata dictionary for model prediction
+    meta_dict = {
+        "age": recipient.age if recipient else 30,
+        "gender": recipient.gender.value if recipient and recipient.gender else "Male",
+        "respiratory_condition": recipient.respiratory_condition_status if recipient else False
+    }
+    
+    logging.info(f"Audio stream started for user: {username}, metadata: {meta_dict}")
+
     device_info = p.get_default_input_device_info()
     logging.info(f"Using device: {device_info.get('name')}")
     stream = p.open(format=FORMAT,
@@ -142,6 +198,7 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
     segment_active = False
     segment_bytes = []
     segment_started_at = None
+    max_segment_duration = 5.0  # Maximum segment duration in seconds before forcing processing
     
     # Calculate timing in samples
     attack_samples = max(1, int(ATTACK_TIME * RATE / CHUNK))
@@ -160,6 +217,16 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
     
     try:
         while True:
+            # Check if WebSocket is still connected before processing
+            try:
+                # Quick ping to detect disconnection early
+                if websocket.client_state.name != "CONNECTED":
+                    logging.info("WebSocket disconnected, stopping audio stream")
+                    break
+            except Exception:
+                logging.info("WebSocket connection check failed, stopping audio stream")
+                break
+            
             data = stream.read(CHUNK, exception_on_overflow=False)
             data_np = np.frombuffer(data, dtype=np.int16)
             
@@ -205,39 +272,65 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
             db_level = calculate_db(rms)
             logging.info(f"RMS: {rms:.1f}, dB: {db_level:.1f}, Gate: {gate_state:.2f}, Hold: {hold_counter}, Adaptive: {adaptive_threshold:.1f}")
             
+            # Check if segment has exceeded maximum duration
+            should_process_segment = False
+            if segment_active and segment_started_at:
+                elapsed = (datetime.utcnow() - segment_started_at).total_seconds()
+                if elapsed >= max_segment_duration:
+                    should_process_segment = True
+                    logging.info(f"Forcing segment processing due to max duration: {elapsed:.2f}s")
+            
             # Only save and send if gate is significantly open
             if gate_state > 0.1:
                 audio_buffer.append(gated_audio.tobytes())
-                segment_bytes.append(gated_audio.tobytes())
+                # Save original audio (noise-reduced but not gated) for better quality
+                segment_bytes.append(reduced_noise.tobytes())
                 if not segment_active:
                     segment_active = True
                     segment_started_at = datetime.utcnow()
                 
                 # Send waveform data to the frontend
-                await websocket.send_text(json.dumps({
-                    "waveform": gated_audio.tolist(),
-                    "rms": float(rms),
-                    "db": float(db_level),
-                    "gate_open": gate_state > 0.5,
-                    "gate_level": float(gate_state),
-                    "hold_active": hold_counter > 0
-                }))
+                try:
+                    await websocket.send_text(json.dumps({
+                        "waveform": gated_audio.tolist(),
+                        "rms": float(rms),
+                        "db": float(db_level),
+                        "gate_open": gate_state > 0.5,
+                        "gate_level": float(gate_state),
+                        "hold_active": hold_counter > 0
+                    }))
+                except Exception as e:
+                    logging.info(f"Failed to send waveform data, client disconnected: {e}")
+                    break
+                
+                # Process segment if max duration reached
+                if should_process_segment:
+                    # Don't wait for gate to close, process immediately
+                    pass  # Will be processed below
             else:
                 # Send silence indicator
-                await websocket.send_text(json.dumps({
-                    "waveform": [0] * len(gated_audio),
-                    "rms": 0.0,
-                    "db": -100.0,
-                    "gate_open": False,
-                    "gate_level": 0.0,
-                    "hold_active": False
-                }))
-
-                if segment_active and segment_bytes:
+                try:
+                    await websocket.send_text(json.dumps({
+                        "waveform": [0] * len(gated_audio),
+                        "rms": 0.0,
+                        "db": -100.0,
+                        "gate_open": False,
+                        "gate_level": 0.0,
+                        "hold_active": False
+                    }))
+                except Exception as e:
+                    logging.info(f"Failed to send silence data, client disconnected: {e}")
+                    break
+            
+            # Process segment when gate closes OR max duration reached
+            if (gate_state <= 0.1 or should_process_segment) and segment_active and segment_bytes:
                     try:
                         raw_bytes = b"".join(segment_bytes)
+                        # Save timestamp before resetting
+                        segment_timestamp = segment_started_at if segment_started_at else datetime.utcnow()
                         segment_active = False
                         segment_bytes = []
+                        segment_started_at = None  # Reset timer
                         duration_sec = len(raw_bytes) / (2 * RATE)
                         if duration_sec >= 0.3:
                             tmp_path = router.media_dir / "_tmp_segment.wav"
@@ -256,12 +349,32 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
                                 y = np.pad(y, (0, target_length - len(y)))
 
                             if router.yamnet_model is None or router.cough_classifier is None or router.preprocessor is None:
-                                logging.warning("Skipping prediction: model or preprocessor not loaded.")
+                                logging.warning(f"Skipping prediction: yamnet={router.yamnet_model is not None}, classifier={router.cough_classifier is not None}, preprocessor={router.preprocessor is not None}")
                                 continue
 
+                            logging.info(f"Processing audio segment: duration={duration_sec:.2f}s")
                             waveform = tf.convert_to_tensor(y, dtype=tf.float32)
-                            _, embeddings, _ = router.yamnet_model(waveform)
-                            embeddings = embeddings.numpy()
+                            
+                            # Call YAMNet to get embeddings
+                            try:
+                                # Use TensorFlow Hub YAMNet directly for embeddings
+                                import tensorflow_hub as hub
+                                
+                                # Load YAMNet from TF Hub on-the-fly (cached after first load)
+                                if not hasattr(router, '_yamnet_hub_model'):
+                                    logging.info("Loading YAMNet from TensorFlow Hub...")
+                                    router._yamnet_hub_model = hub.load('https://tfhub.dev/google/yamnet/1')
+                                
+                                # YAMNet expects waveform, returns (scores, embeddings, spectrogram)
+                                _, embeddings, _ = router._yamnet_hub_model(waveform)
+                                embeddings = embeddings.numpy()
+                                
+                                logging.info(f"YAMNet embeddings extracted successfully")
+                            except Exception as e:
+                                logging.error(f"YAMNet inference error: {e}")
+                                raise
+                            
+                            logging.info(f"YAMNet embeddings shape: {embeddings.shape}")
                             if embeddings.shape[0] < router.max_segments:
                                 embeddings = np.pad(embeddings, ((0, router.max_segments - embeddings.shape[0]), (0, 0)), mode='constant')
                             else:
@@ -269,27 +382,39 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
 
                             meta_df = pd.DataFrame([meta_dict])
                             meta_input = router.preprocessor.transform(meta_df).astype('float32')
+                            logging.info(f"Running prediction with metadata: {meta_dict}")
                             pred = router.cough_classifier.predict([embeddings[np.newaxis, :, :], meta_input], verbose=0)
                             prob = float(pred[0, 0])
                             label = "Cough" if prob >= router.threshold else "Not Cough"
+                            logging.info(f"Prediction result: {label} (probability={prob:.3f})")
 
                             event = {
                                 "event": "prediction",
-                                "timestamp": segment_started_at.isoformat() + "Z",
+                                "timestamp": segment_timestamp.isoformat() + "Z",
                                 "probability": prob,
                                 "label": label
                             }
 
                             if label == "Cough":
-                                ts = segment_started_at.strftime("%Y%m%dT%H%M%S%fZ")
+                                ts = segment_timestamp.strftime("%Y%m%dT%H%M%S%fZ")
                                 out_path = router.media_dir / f"cough_{ts}.wav"
-                                sf.write(str(out_path), y, sr, subtype='PCM_16')
+                                
+                                # Normalize audio to -20 dB for consistent volume (critical for elderly voices)
+                                y_int16 = (y * 32768).astype(np.int16)
+                                y_normalized = normalize_audio(y_int16, target_db=-20.0)
+                                
+                                # Save normalized audio
+                                sf.write(str(out_path), y_normalized, sr, subtype='PCM_16')
                                 event["media_url"] = f"/media/cough/{out_path.name}"
                                 sidecar = {"timestamp": event["timestamp"], "probability": prob, "label": label, "media_url": event["media_url"], "username": username, "caretaker_id": (caretaker.id if caretaker else None), "recipient_id": (recipient.id if recipient else None), "age": meta_dict["age"], "gender": meta_dict["gender"], "respiratory_condition": meta_dict["respiratory_condition"]}
                                 with open(str(out_path.with_suffix('.json')), 'w', encoding='utf-8') as f:
                                     json.dump(sidecar, f)
 
-                            await websocket.send_text(json.dumps(event))
+                            try:
+                                await websocket.send_text(json.dumps(event))
+                            except Exception as e:
+                                logging.info(f"Failed to send prediction event, client disconnected: {e}")
+                                break
                     except Exception as e:
                         logging.error(f"Segment processing failed: {e}", exc_info=True)
 

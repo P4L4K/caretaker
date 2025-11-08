@@ -1,34 +1,341 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard</title>
-    <link rel="stylesheet" href="styles.css">
-    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <title>CareTaker AI - Dashboard</title>
+    <link rel="stylesheet" href="styles_modern.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
-    <div class="container">
-        <h2>Welcome to your Dashboard</h2>
-        <p>You have successfully logged in.</p>
-        
-        <div id="audio-container">
-            <h3>Live Audio Feed</h3>
-            <div id="status-indicators">
-                <span id="recording-status"></span>
-                <span id="processing-status"></span>
-                <span id="silence-status"></span>
+    <!-- Navigation Bar -->
+    <nav class="navbar">
+        <div class="nav-container">
+            <div class="nav-brand">
+                <i class="fas fa-heartbeat"></i>
+                <span>CareTaker AI</span>
             </div>
-            <div class="waveform-container">
-        <canvas id="waveform" width="800" height="200"></canvas>
-    </div>
-            <div id="rms-meter">
-                <div id="rms-level"></div>
+            <div class="nav-user">
+                <span id="username-display"></span>
+                <button id="logout-btn" class="btn-logout">
+                    <i class="fas fa-sign-out-alt"></i> Logout
+                </button>
             </div>
         </div>
+    </nav>
 
-        <a href="index.html">Logout</a>
+    <!-- Main Dashboard -->
+    <div class="dashboard-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-menu">
+                <a href="#audio-section" class="menu-item active" data-section="audio">
+                    <i class="fas fa-microphone"></i>
+                    <span>Audio Monitoring</span>
+                </a>
+                <a href="#video-section" class="menu-item" data-section="video">
+                    <i class="fas fa-video"></i>
+                    <span>Video Monitoring</span>
+                </a>
+                <a href="#history-section" class="menu-item" data-section="history">
+                    <i class="fas fa-history"></i>
+                    <span>Detection History</span>
+                </a>
+                <a href="#settings-section" class="menu-item" data-section="settings">
+                    <i class="fas fa-cog"></i>
+                    <span>Settings</span>
+                </a>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Audio Monitoring Section -->
+            <section id="audio-section" class="content-section active">
+                <div class="section-header">
+                    <h2><i class="fas fa-microphone"></i> Real-time Audio Monitoring</h2>
+                    <div class="connection-status">
+                        <span class="status-dot" id="audio-status-dot"></span>
+                        <span id="audio-status-text">Not Connected</span>
+                    </div>
+                </div>
+
+                <!-- Stats Cards -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon" style="background: #4CAF50;">
+                            <i class="fas fa-check-circle"></i>
+                        </div>
+                        <div class="stat-info">
+                            <h3 id="total-coughs">0</h3>
+                            <p>Total Coughs Detected</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon" style="background: #2196F3;">
+                            <i class="fas fa-clock"></i>
+                        </div>
+                        <div class="stat-info">
+                            <h3 id="last-cough-time">--:--</h3>
+                            <p>Last Cough Detected</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon" style="background: #FF9800;">
+                            <i class="fas fa-chart-line"></i>
+                        </div>
+                        <div class="stat-info">
+                            <h3 id="avg-confidence">0%</h3>
+                            <p>Average Confidence</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon" style="background: #9C27B0;">
+                            <i class="fas fa-calendar-day"></i>
+                        </div>
+                        <div class="stat-info">
+                            <h3 id="today-coughs">0</h3>
+                            <p>Today's Detections</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Audio Waveform -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3><i class="fas fa-wave-square"></i> Live Audio Waveform</h3>
+                        <div class="audio-controls">
+                            <span class="audio-level-label">Audio Level:</span>
+                            <span id="db-level" class="audio-level-value">-∞ dB</span>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <canvas id="waveform" width="1200" height="200"></canvas>
+                        <div class="rms-meter-container">
+                            <div class="rms-meter">
+                                <div id="rms-level" class="rms-level"></div>
+                            </div>
+                            <span class="rms-label">RMS Level</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Recent Detections -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3><i class="fas fa-bell"></i> Recent Cough Detections</h3>
+                        <button class="btn-secondary" id="clear-alerts">
+                            <i class="fas fa-trash"></i> Clear
+                        </button>
+                    </div>
+                    <div class="card-body">
+                        <div id="recent-detections" class="detections-list">
+                            <div class="empty-state">
+                                <i class="fas fa-inbox"></i>
+                                <p>No cough detections yet. Monitoring in progress...</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Video Monitoring Section -->
+            <section id="video-section" class="content-section">
+                <div class="section-header">
+                    <h2><i class="fas fa-video"></i> Real-time Video Monitoring</h2>
+                    <div class="connection-status">
+                        <span class="status-dot" id="video-status-dot"></span>
+                        <span id="video-status-text">Stopped</span>
+                    </div>
+                </div>
+
+                <div class="video-grid">
+                    <!-- Video Feed -->
+                    <div class="card video-card">
+                        <div class="card-header">
+                            <h3><i class="fas fa-camera"></i> Live Video Feed</h3>
+                            <button class="btn-primary" id="toggle-video">
+                                <i class="fas fa-play"></i> Start Video
+                            </button>
+                        </div>
+                        <div class="card-body">
+                            <div class="video-container">
+                                <video id="video-feed" autoplay playsinline></video>
+                                <div class="video-overlay">
+                                    <div class="emotion-display" id="emotion-display">
+                                        <i class="fas fa-smile"></i>
+                                        <span id="current-emotion">--</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Emotion Stats -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h3><i class="fas fa-chart-pie"></i> Emotion Analysis</h3>
+                        </div>
+                        <div class="card-body">
+                            <canvas id="emotion-chart" height="300"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Fall Detection Alert -->
+                <div class="card alert-card" id="fall-alert" style="display: none;">
+                    <div class="alert-content">
+                        <i class="fas fa-exclamation-triangle"></i>
+                        <div>
+                            <h3>Fall Detected!</h3>
+                            <p id="fall-timestamp">--</p>
+                        </div>
+                        <button class="btn-close" onclick="document.getElementById('fall-alert').style.display='none'">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- History Section -->
+            <section id="history-section" class="content-section">
+                <div class="section-header">
+                    <h2><i class="fas fa-history"></i> Detection History</h2>
+                    <button class="btn-primary" id="export-history">
+                        <i class="fas fa-download"></i> Export CSV
+                    </button>
+                </div>
+
+                <!-- Search and Filter -->
+                <div class="card">
+                    <div class="card-body">
+                        <div class="search-filter-container">
+                            <div class="search-box">
+                                <i class="fas fa-search"></i>
+                                <input type="text" id="search-input" placeholder="Search by recipient name...">
+                            </div>
+                            <div class="filter-group">
+                                <label>Date Range:</label>
+                                <input type="date" id="date-from">
+                                <span>to</span>
+                                <input type="date" id="date-to">
+                            </div>
+                            <button class="btn-secondary" id="apply-filters">
+                                <i class="fas fa-filter"></i> Apply Filters
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- History Table -->
+                <div class="card">
+                    <div class="card-body">
+                        <div class="table-container">
+                            <table class="history-table">
+                                <thead>
+                                    <tr>
+                                        <th>Timestamp</th>
+                                        <th>Recipient</th>
+                                        <th>Confidence</th>
+                                        <th>Audio</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="history-tbody">
+                                    <tr class="loading-row">
+                                        <td colspan="5">
+                                            <div class="loading-spinner"></div>
+                                            <p>Loading history...</p>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Settings Section -->
+            <section id="settings-section" class="content-section">
+                <div class="section-header">
+                    <h2><i class="fas fa-cog"></i> Settings</h2>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3><i class="fas fa-bell"></i> Notification Settings</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="setting-item">
+                            <label class="switch">
+                                <input type="checkbox" id="sound-alerts" checked>
+                                <span class="slider"></span>
+                            </label>
+                            <div class="setting-info">
+                                <h4>Sound Alerts</h4>
+                                <p>Play sound when cough is detected</p>
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <label class="switch">
+                                <input type="checkbox" id="desktop-notifications" checked>
+                                <span class="slider"></span>
+                            </label>
+                            <div class="setting-info">
+                                <h4>Desktop Notifications</h4>
+                                <p>Show browser notifications for detections</p>
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <label class="switch">
+                                <input type="checkbox" id="fall-alerts" checked>
+                                <span class="slider"></span>
+                            </label>
+                            <div class="setting-info">
+                                <h4>Fall Detection Alerts</h4>
+                                <p>Alert immediately when fall is detected</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h3><i class="fas fa-sliders-h"></i> Detection Sensitivity</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="setting-item">
+                            <div class="setting-info">
+                                <h4>Cough Detection Threshold</h4>
+                                <p>Adjust sensitivity for cough detection</p>
+                            </div>
+                            <input type="range" id="cough-threshold" min="0" max="100" value="50" class="slider-range">
+                            <span id="threshold-value">50%</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Audio Player Modal -->
+    <div id="audio-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-play-circle"></i> Audio Playback</h3>
+                <button class="btn-close" onclick="closeAudioModal()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div class="modal-body">
+                <audio id="audio-player" controls></audio>
+                <div class="audio-info">
+                    <p><strong>Timestamp:</strong> <span id="modal-timestamp"></span></p>
+                    <p><strong>Confidence:</strong> <span id="modal-confidence"></span></p>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script src="js/dashboard.js"></script>

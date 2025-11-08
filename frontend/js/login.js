@@ -22,9 +22,10 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
         const data = await response.json();
 
         if (response.ok) {
-            // Store the token
+            // Store the token and username
             localStorage.setItem('token', data.result.access_token);
-            // Redirect to dashboard or home page
+            localStorage.setItem('username', username);
+            // Redirect to dashboard
             window.location.href = 'dashboard.html';
         } else {
             alert(data.detail || 'Login failed. Please try again.');

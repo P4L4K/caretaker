@@ -11,13 +11,17 @@ from datetime import datetime
 
 # Import your model functions/classes
 from models.video.emotion_recognition import get_emotion_from_frame
-from models.video.fall_detection import FallDetector
+try:
+    from models.video.fall_detection import FallDetector
+    _fall_detector = FallDetector()
+    FALL_DETECTION_AVAILABLE = True
+except Exception as e:
+    print(f"Warning: Fall detection not available: {e}")
+    _fall_detector = None
+    FALL_DETECTION_AVAILABLE = False
 
 # Router setup
 router = APIRouter(prefix="/video", tags=["video"])
-
-# Fall detection model instance
-_fall_detector = FallDetector()
 _fall_log_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "fall_log.json"))
 
 # ----------------------- CAMERA CAPTURE THREAD -----------------------
@@ -130,9 +134,11 @@ async def analyze_frame(file: UploadFile = File(...)):
             target_width=640,
         )
 
-        fall_res = _fall_detector.detect_fall(frame)
-        if fall_res.get("fall_detected"):
-            _append_fall_log(fall_res)
+        fall_res = {"fall_detected": False, "timestamp": None}
+        if FALL_DETECTION_AVAILABLE and _fall_detector:
+            fall_res = _fall_detector.detect_fall(frame)
+            if fall_res.get("fall_detected"):
+                _append_fall_log(fall_res)
 
         return JSONResponse({
             "mood": dom or "neutral",
@@ -182,10 +188,12 @@ async def stream_video(camera_index: int = 0, interval_ms: int = 300, frame_skip
                     print(f"Emotion detection error: {e}")
 
             # Run fall detection on every frame
-            fall_res = _fall_detector.detect_fall(frame)
-            if fall_res.get("fall_detected"):
-                _append_fall_log(fall_res)
-                print(f"[ALERT] Fall detected at {fall_res.get('timestamp')}")
+            fall_res = {"fall_detected": False, "timestamp": None}
+            if FALL_DETECTION_AVAILABLE and _fall_detector:
+                fall_res = _fall_detector.detect_fall(frame)
+                if fall_res.get("fall_detected"):
+                    _append_fall_log(fall_res)
+                    print(f"[ALERT] Fall detected at {fall_res.get('timestamp')}")
 
             payload = {
                 "mood": last_dom or "neutral",
@@ -204,6 +212,9 @@ async def stream_video(camera_index: int = 0, interval_ms: int = 300, frame_skip
 async def test_fall(file: UploadFile = File(...)):
     """Test fall detection with a single uploaded frame"""
     try:
+        if not FALL_DETECTION_AVAILABLE or not _fall_detector:
+            raise HTTPException(status_code=503, detail="Fall detection is not available. Please install ultralytics.")
+        
         data = await file.read()
         np_arr = np.frombuffer(data, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)

@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Model Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        h1 { color: #333; }
+        h2 { color: #666; margin-top: 0; }
+        video {
+            width: 100%;
+            max-width: 640px;
+            border: 2px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px 5px;
+        }
+        button:hover { background: #45a049; }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .status.success { background: #d4edda; color: #155724; }
+        .status.error { background: #f8d7da; color: #721c24; }
+        .status.info { background: #d1ecf1; color: #0c5460; }
+        .result {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 4px;
+            margin: 10px 0;
+            font-family: monospace;
+        }
+        .log {
+            background: #000;
+            color: #0f0;
+            padding: 15px;
+            border-radius: 4px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .log-entry {
+            margin: 5px 0;
+            padding: 2px 0;
+            border-bottom: 1px solid #333;
+        }
+        .emotion-display {
+            font-size: 48px;
+            text-align: center;
+            padding: 20px;
+            background: #f0f0f0;
+            border-radius: 8px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎥 Video Model Test Page</h1>
+    
+    <div class="container">
+        <h2>1. Backend Status</h2>
+        <button onclick="checkBackend()">Check Backend</button>
+        <div id="backend-status"></div>
+    </div>
+
+    <div class="container">
+        <h2>2. Video Stream</h2>
+        <video id="video" autoplay playsinline></video>
+        <br>
+        <button onclick="startVideo()">Start Video</button>
+        <button onclick="stopVideo()">Stop Video</button>
+        <div id="video-status"></div>
+    </div>
+
+    <div class="container">
+        <h2>3. Frame Analysis</h2>
+        <button id="analyze-btn" onclick="analyzeFrame()" disabled>Analyze Current Frame</button>
+        <button id="auto-btn" onclick="toggleAuto()">Start Auto-Analysis</button>
+        <div class="emotion-display" id="emotion-display">--</div>
+        <div id="analysis-result"></div>
+    </div>
+
+    <div class="container">
+        <h2>4. Console Log</h2>
+        <button onclick="clearLog()">Clear Log</button>
+        <div class="log" id="console-log"></div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000';
+        let videoStream = null;
+        let autoAnalyzeInterval = null;
+
+        function log(message, type = 'info') {
+            const logDiv = document.getElementById('console-log');
+            const timestamp = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.textContent = `[${timestamp}] ${message}`;
+            logDiv.appendChild(entry);
+            logDiv.scrollTop = logDiv.scrollHeight;
+            console.log(message);
+        }
+
+        function clearLog() {
+            document.getElementById('console-log').innerHTML = '';
+        }
+
+        async function checkBackend() {
+            const statusDiv = document.getElementById('backend-status');
+            statusDiv.innerHTML = '<div class="status info">Checking backend...</div>';
+            
+            try {
+                const response = await fetch(`${API_BASE}/`);
+                const data = await response.json();
+                
+                if (response.ok) {
+                    statusDiv.innerHTML = `<div class="status success">✅ Backend is running: ${data.message}</div>`;
+                    log('Backend check: SUCCESS');
+                } else {
+                    statusDiv.innerHTML = `<div class="status error">❌ Backend returned error: ${response.status}</div>`;
+                    log('Backend check: ERROR ' + response.status);
+                }
+            } catch (error) {
+                statusDiv.innerHTML = `<div class="status error">❌ Cannot connect to backend: ${error.message}</div>`;
+                log('Backend check: FAILED - ' + error.message);
+            }
+        }
+
+        async function startVideo() {
+            const statusDiv = document.getElementById('video-status');
+            const videoElement = document.getElementById('video');
+            
+            try {
+                videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
+                videoElement.srcObject = videoStream;
+                statusDiv.innerHTML = '<div class="status success">✅ Video stream started</div>';
+                document.getElementById('analyze-btn').disabled = false;
+                log('Video stream started');
+                
+                videoElement.addEventListener('loadeddata', () => {
+                    log(`Video ready: ${videoElement.videoWidth}x${videoElement.videoHeight}`);
+                });
+            } catch (error) {
+                statusDiv.innerHTML = `<div class="status error">❌ Failed to start video: ${error.message}</div>`;
+                log('Video start failed: ' + error.message);
+            }
+        }
+
+        function stopVideo() {
+            const statusDiv = document.getElementById('video-status');
+            const videoElement = document.getElementById('video');
+            
+            if (videoStream) {
+                videoStream.getTracks().forEach(track => track.stop());
+                videoElement.srcObject = null;
+                videoStream = null;
+                statusDiv.innerHTML = '<div class="status info">Video stream stopped</div>';
+                document.getElementById('analyze-btn').disabled = true;
+                log('Video stream stopped');
+                
+                if (autoAnalyzeInterval) {
+                    clearInterval(autoAnalyzeInterval);
+                    autoAnalyzeInterval = null;
+                    document.getElementById('auto-btn').textContent = 'Start Auto-Analysis';
+                }
+            }
+        }
+
+        async function analyzeFrame() {
+            const videoElement = document.getElementById('video');
+            const resultDiv = document.getElementById('analysis-result');
+            const emotionDiv = document.getElementById('emotion-display');
+            
+            if (!videoStream) {
+                resultDiv.innerHTML = '<div class="status error">❌ Video not started</div>';
+                return;
+            }
+
+            if (videoElement.readyState < 2) {
+                resultDiv.innerHTML = '<div class="status error">❌ Video not ready yet</div>';
+                log('Video not ready, readyState: ' + videoElement.readyState);
+                return;
+            }
+
+            try {
+                // Create canvas and capture frame
+                const canvas = document.createElement('canvas');
+                canvas.width = 640;
+                canvas.height = 480;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+                
+                log('Frame captured from video');
+
+                // Convert to blob
+                canvas.toBlob(async (blob) => {
+                    if (!blob) {
+                        resultDiv.innerHTML = '<div class="status error">❌ Failed to create blob</div>';
+                        log('Blob creation failed');
+                        return;
+                    }
+
+                    log(`Blob created: ${blob.size} bytes`);
+
+                    // Send to backend
+                    const formData = new FormData();
+                    formData.append('file', blob, 'frame.jpg');
+
+                    resultDiv.innerHTML = '<div class="status info">⏳ Analyzing frame...</div>';
+                    log('Sending frame to backend...');
+
+                    try {
+                        const startTime = Date.now();
+                        const response = await fetch(`${API_BASE}/video/analyze`, {
+                            method: 'POST',
+                            body: formData
+                        });
+
+                        const elapsed = Date.now() - startTime;
+
+                        if (response.ok) {
+                            const data = await response.json();
+                            const resultHTML = `
+                                <div class="status success">✅ Analysis successful (${elapsed}ms)</div>
+                                <div class="result">
+                                    <strong>Emotion:</strong> ${data.mood}<br>
+                                    <strong>Fall Detected:</strong> ${data.fall_detected ? 'YES ⚠️' : 'No'}<br>
+                                    <strong>Timestamp:</strong> ${data.timestamp}
+                                </div>
+                            `;
+                            resultDiv.innerHTML = resultHTML;
+                            emotionDiv.textContent = data.mood.toUpperCase();
+                            log(`Analysis result: ${data.mood}, fall: ${data.fall_detected}`);
+                        } else {
+                            const errorText = await response.text();
+                            resultDiv.innerHTML = `<div class="status error">❌ Backend error: ${response.status}<br>${errorText}</div>`;
+                            log(`Backend error: ${response.status} - ${errorText}`);
+                        }
+                    } catch (fetchError) {
+                        resultDiv.innerHTML = `<div class="status error">❌ Fetch error: ${fetchError.message}</div>`;
+                        log('Fetch error: ' + fetchError.message);
+                    }
+                }, 'image/jpeg', 0.8);
+
+            } catch (error) {
+                resultDiv.innerHTML = `<div class="status error">❌ Error: ${error.message}</div>`;
+                log('Analysis error: ' + error.message);
+            }
+        }
+
+        function toggleAuto() {
+            const btn = document.getElementById('auto-btn');
+            
+            if (autoAnalyzeInterval) {
+                clearInterval(autoAnalyzeInterval);
+                autoAnalyzeInterval = null;
+                btn.textContent = 'Start Auto-Analysis';
+                log('Auto-analysis stopped');
+            } else {
+                autoAnalyzeInterval = setInterval(analyzeFrame, 2000);
+                btn.textContent = 'Stop Auto-Analysis';
+                log('Auto-analysis started (every 2 seconds)');
+            }
+        }
+
+        // Auto-check backend on load
+        window.addEventListener('load', () => {
+            log('Test page loaded');
+            checkBackend();
+        });
+    </script>
+</body>
+</html>
