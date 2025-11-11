@@ -5,6 +5,7 @@ let videoStream = null;
 let emotionChart = null;
 let allDetections = [];
 let recentDetections = [];
+let statsUpdateInterval = null;
 
 document.addEventListener('DOMContentLoaded', () => {
     const token = localStorage.getItem('token');
@@ -29,6 +30,10 @@ function initializeDashboard() {
     document.getElementById('date-to').value = today;
     const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
     document.getElementById('date-from').value = weekAgo;
+    
+    // Start real-time stats updates
+    fetchAndUpdateStats();
+    statsUpdateInterval = setInterval(fetchAndUpdateStats, 5000); // Update every 5 seconds
 }
 
 function setupEventListeners() {
@@ -175,7 +180,12 @@ function updateRecentDetectionsList() {
         container.innerHTML = '<div class="empty-state"><i class="fas fa-inbox"></i><p>No cough detections yet...</p></div>';
         return;
     }
-    container.innerHTML = recentDetections.map(d => `
+    
+    console.log('Updating recent detections list:', recentDetections);
+    
+    container.innerHTML = recentDetections.map(d => {
+        console.log('Detection media_url:', d.media_url);
+        return `
         <div class="detection-item">
             <div class="detection-info">
                 <div class="detection-time">${new Date(d.timestamp).toLocaleString()}</div>
@@ -183,7 +193,8 @@ function updateRecentDetectionsList() {
             </div>
             <button class="btn-icon" onclick="playAudio('${d.media_url}')" title="Play"><i class="fas fa-play"></i></button>
         </div>
-    `).join('');
+    `;
+    }).join('');
 }
 
 function updateStats() {
@@ -197,6 +208,42 @@ function updateStats() {
     const today = new Date().toDateString();
     const todayCoughs = allDetections.filter(d => new Date(d.timestamp).toDateString() === today).length;
     document.getElementById('today-coughs').textContent = todayCoughs;
+}
+
+async function fetchAndUpdateStats() {
+    try {
+        const response = await fetch(`${API_BASE}/api/cough/stats`);
+        if (!response.ok) {
+            console.error('Failed to fetch stats:', response.status);
+            return;
+        }
+        const stats = await response.json();
+        
+        // Update dashboard stats
+        document.getElementById('total-coughs').textContent = stats.total_detections || 0;
+        document.getElementById('today-coughs').textContent = stats.today_detections || 0;
+        
+        if (stats.last_detection_time) {
+            const lastTime = new Date(stats.last_detection_time);
+            document.getElementById('last-cough-time').textContent = lastTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+        } else {
+            document.getElementById('last-cough-time').textContent = '--:--';
+        }
+        
+        if (stats.average_probability) {
+            document.getElementById('avg-confidence').textContent = (stats.average_probability * 100).toFixed(0) + '%';
+        } else {
+            document.getElementById('avg-confidence').textContent = '0%';
+        }
+        
+        // Update recent detections list
+        if (stats.recent_detections && stats.recent_detections.length > 0) {
+            recentDetections = stats.recent_detections;
+            updateRecentDetectionsList();
+        }
+    } catch (error) {
+        console.error('Error fetching stats:', error);
+    }
 }
 
 async function toggleVideo() {
@@ -367,12 +414,16 @@ async function loadDetectionHistory() {
     tbody.innerHTML = '<tr class="loading-row"><td colspan="5"><div class="loading-spinner"></div><p>Loading...</p></td></tr>';
     
     try {
-        const response = await fetch(`${API_BASE}/api/cough/detections`);
+        const response = await fetch(`${API_BASE}/api/cough/detections/all`);
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
         const data = await response.json();
         allDetections = data.items || [];
         displayHistory(allDetections);
         updateStats();
     } catch (error) {
+        console.error('Error loading detection history:', error);
         tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#F44336;">Error loading history</td></tr>';
     }
 }
@@ -430,9 +481,21 @@ function exportHistory() {
 function playAudio(mediaUrl) {
     const modal = document.getElementById('audio-modal');
     const player = document.getElementById('audio-player');
+    
+    console.log('Playing audio:', API_BASE + mediaUrl);
+    
+    // Set the audio source
     player.src = API_BASE + mediaUrl;
+    
+    // Show the modal
     modal.classList.add('active');
-    player.play();
+    modal.style.display = 'flex';
+    
+    // Play the audio with error handling
+    player.play().catch(error => {
+        console.error('Error playing audio:', error);
+        alert('Failed to play audio. Please check if the file exists.');
+    });
 }
 
 function closeAudioModal() {
@@ -441,6 +504,7 @@ function closeAudioModal() {
     player.pause();
     player.src = '';
     modal.classList.remove('active');
+    modal.style.display = 'none';
 }
 
 function downloadAudio(mediaUrl) {
@@ -449,6 +513,11 @@ function downloadAudio(mediaUrl) {
     a.download = mediaUrl.split('/').pop();
     a.click();
 }
+
+// Expose functions to global scope for inline onclick handlers
+window.playAudio = playAudio;
+window.closeAudioModal = closeAudioModal;
+window.downloadAudio = downloadAudio;
 
 async function handleLogout() {
     console.log('Logout initiated...');
@@ -476,6 +545,12 @@ async function handleLogout() {
         console.log('Clearing video analysis interval...');
         clearInterval(window.videoAnalyzeInterval);
         window.videoAnalyzeInterval = null;
+    }
+    
+    if (statsUpdateInterval) {
+        console.log('Clearing stats update interval...');
+        clearInterval(statsUpdateInterval);
+        statsUpdateInterval = null;
     }
     
     // Destroy Chart.js instance

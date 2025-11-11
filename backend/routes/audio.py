@@ -23,6 +23,7 @@ from tables.users import CareTaker, CareRecipient
 from repository.users import UsersRepo
 from repository.users import JWTRepo
 from repository.token_blocklist import TokenBlocklistRepo
+from repository import cough_detections as cough_repo
 from config import get_db
 
 # Configure logging
@@ -35,17 +36,17 @@ CHANNELS = 1
 FORMAT = pyaudio.paInt16
 WAVE_OUTPUT_FILENAME = "output.wav"
 
-# Noise gate parameters - OPTIMIZED FOR ELDERLY CARE ENVIRONMENTS
-# Designed for low-medium noise (hospitals, nursing homes, bedrooms)
-# Target sounds: coughs, snores, groans, breathing irregularities, falls, calls for help
-NOISE_GATE_THRESHOLD = -45  # dB threshold (sensitive for elderly voices)
-SILENCE_THRESHOLD_RMS = 600  # Lower for quieter elderly speech and sounds
+# Noise gate parameters - HIGHLY OPTIMIZED FOR ELDERLY CARE
+# Designed for VERY QUIET elderly voices and weak coughs
+# Target sounds: weak coughs, snores, groans, breathing irregularities, falls, calls for help
+NOISE_GATE_THRESHOLD = -55  # dB threshold (VERY sensitive for weak elderly voices)
+SILENCE_THRESHOLD_RMS = 300  # MUCH lower for very quiet elderly sounds
 # CRITICAL: Fast attack for transient detection (coughs, falls)
-ATTACK_TIME = 0.005  # 5ms - Captures sudden sounds like coughs, falls
-# Moderate release for natural decay
-RELEASE_TIME = 0.15  # 150ms - Slightly longer to capture full coughs/snores
-# Hold time to prevent choppy gating during labored breathing
-HOLD_TIME = 0.08  # 80ms - Longer hold for elderly speech patterns
+ATTACK_TIME = 0.003  # 3ms - Even faster to catch weak transients
+# Longer release to capture full weak coughs
+RELEASE_TIME = 0.25  # 250ms - Longer to capture complete weak coughs
+# Extended hold time for weak, labored breathing patterns
+HOLD_TIME = 0.15  # 150ms - Much longer hold for weak elderly speech
 
 router = APIRouter()
 p = pyaudio.PyAudio()
@@ -124,6 +125,109 @@ def normalize_audio(audio, target_db=-20.0):
     logging.info(f"Audio normalization: {current_db:.1f} dB → {target_db:.1f} dB (gain: {gain_db:+.1f} dB)")
     
     return normalized.astype(np.int16)
+
+def enhance_audio_for_elderly(y, sr=16000):
+    """
+    Enhance audio specifically for elderly voice detection.
+    Improves weak cough detection while preserving natural characteristics.
+    
+    Args:
+        y: Audio signal (float32, normalized)
+        sr: Sample rate
+    
+    Returns:
+        Enhanced audio signal (float32)
+    """
+    try:
+        enhanced = y.copy()
+        
+        # 1. High-pass filter to remove low-frequency noise
+        # Elderly coughs are typically 200-2000 Hz, remove below 80 Hz
+        from scipy import signal
+        nyquist = sr // 2
+        low_cutoff = 80 / nyquist
+        high_cutoff = 4000 / nyquist  # Remove high-frequency noise above 4kHz
+        
+        # Band-pass filter (80Hz - 4kHz) - optimal for cough detection
+        b, a = signal.butter(4, [low_cutoff, high_cutoff], btype='band')
+        enhanced = signal.filtfilt(b, a, enhanced)
+        
+        # 2. Spectral enhancement - boost cough frequency ranges
+        # Coughs have strong energy in 200-800 Hz and 1000-2000 Hz
+        stft = librosa.stft(enhanced, n_fft=2048, hop_length=512)
+        magnitude = np.abs(stft)
+        phase = np.angle(stft)
+        
+        # Create frequency mask for enhancement
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+        
+        # Boost cough-dominant frequencies
+        freq_mask = np.ones_like(freqs)
+        # Primary cough range: 200-800 Hz
+        freq_mask[(freqs >= 200) & (freqs <= 800)] = 1.5
+        # Secondary cough range: 1000-2000 Hz  
+        freq_mask[(freqs >= 1000) & (freqs <= 2000)] = 1.3
+        # Reduce noise frequencies
+        freq_mask[freqs < 100] = 0.5  # Reduce very low frequencies
+        freq_mask[freqs > 3000] = 0.8  # Reduce high frequencies
+        
+        # Apply frequency weighting
+        enhanced_magnitude = magnitude * freq_mask[:, np.newaxis]
+        
+        # Reconstruct signal
+        enhanced_stft = enhanced_magnitude * np.exp(1j * phase)
+        enhanced = librosa.istft(enhanced_stft, hop_length=512)
+        
+        # 3. Dynamic range compression for weak sounds
+        # Helps bring out weak cough characteristics
+        threshold = 0.6
+        ratio = 4.0
+        
+        # Apply soft compression
+        abs_enhanced = np.abs(enhanced)
+        mask = abs_enhanced > threshold
+        compressed = np.where(mask, 
+                             threshold + (abs_enhanced - threshold) / ratio,
+                             abs_enhanced)
+        enhanced = np.sign(enhanced) * compressed
+        
+        # 4. Gentle noise reduction specifically for speech
+        # Use spectral subtraction with conservative parameters
+        stft = librosa.stft(enhanced, n_fft=2048, hop_length=512)
+        magnitude = np.abs(stft)
+        
+        # Estimate noise from quiet portions
+        noise_floor = np.percentile(magnitude, 10, axis=1, keepdims=True) * 0.3
+        
+        # Spectral subtraction with over-subtraction factor
+        alpha = 0.1  # Conservative over-subtraction
+        beta = 0.01  # Spectral floor
+        
+        enhanced_magnitude = magnitude - alpha * noise_floor
+        enhanced_magnitude = np.maximum(enhanced_magnitude, beta * magnitude)
+        
+        # Reconstruct
+        enhanced_stft = enhanced_magnitude * np.exp(1j * np.angle(stft))
+        enhanced = librosa.istft(enhanced_stft, hop_length=512)
+        
+        # 5. Final normalization to prevent clipping
+        max_val = np.max(np.abs(enhanced))
+        if max_val > 0:
+            enhanced = enhanced / max_val * 0.95
+        
+        # 6. Ensure same length as input
+        if len(enhanced) != len(y):
+            if len(enhanced) > len(y):
+                enhanced = enhanced[:len(y)]
+            else:
+                enhanced = np.pad(enhanced, (0, len(y) - len(enhanced)))
+        
+        logging.info(f"Audio enhancement applied: {len(y)} samples → {len(enhanced)} samples")
+        return enhanced
+        
+    except Exception as e:
+        logging.warning(f"Audio enhancement failed, using original: {e}")
+        return y
 
 def apply_noise_gate_with_hold(audio_data, rms, gate_state, hold_counter, 
                                 attack_samples, release_samples, hold_samples, adaptive_threshold):
@@ -212,8 +316,8 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
     # Rolling buffer for adaptive noise floor estimation
     noise_floor_buffer = []
     noise_floor_size = 100  # Larger buffer for stable noise floor in care environment
-    MIN_NOISE_THRESHOLD = 100  # Lower baseline for quiet elderly care settings
-    MAX_NOISE_THRESHOLD = 800  # Cap to prevent adaptation to loud events
+    MIN_NOISE_THRESHOLD = 50   # VERY low baseline for extremely quiet elderly voices
+    MAX_NOISE_THRESHOLD = 500  # Lower cap to stay sensitive to weak sounds
     
     try:
         while True:
@@ -233,17 +337,17 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
             # Calculate initial RMS
             rms_raw = np.sqrt(np.mean(np.square(data_np.astype(np.float32))))
             
-            # Adaptive noise floor estimation - OPTIMIZED FOR CARE ENVIRONMENTS
-            # Only update noise floor with LOW values (ambient noise, not patient sounds)
-            if rms_raw < SILENCE_THRESHOLD_RMS * 0.7:  # Only track quiet ambient noise
+            # Adaptive noise floor estimation - HIGHLY SENSITIVE FOR ELDERLY
+            # Only update noise floor with VERY LOW values (ambient noise, not patient sounds)
+            if rms_raw < SILENCE_THRESHOLD_RMS * 0.5:  # Only track very quiet ambient noise
                 if len(noise_floor_buffer) >= noise_floor_size:
                     noise_floor_buffer.pop(0)
                 noise_floor_buffer.append(rms_raw)
             
-            # Calculate adaptive threshold from ambient noise only
+            # Calculate adaptive threshold - MORE SENSITIVE
             if len(noise_floor_buffer) > 20:
                 adaptive_threshold = np.clip(
-                    np.percentile(noise_floor_buffer, 85) * 1.3,
+                    np.percentile(noise_floor_buffer, 75) * 1.2,  # Lower percentile and multiplier
                     MIN_NOISE_THRESHOLD,
                     MAX_NOISE_THRESHOLD
                 )
@@ -251,12 +355,12 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
                 adaptive_threshold = MIN_NOISE_THRESHOLD
             
             # Always apply noise reduction for consistent processing
-            # Gentler noise reduction to preserve elderly speech characteristics
+            # VERY GENTLE noise reduction to preserve weak elderly speech
             reduced_noise = nr.reduce_noise(
                 y=data_np, 
                 sr=RATE, 
                 stationary=True,
-                prop_decrease=0.5  # Less aggressive to preserve weak sounds
+                prop_decrease=0.3  # Much less aggressive to preserve very weak sounds
             )
             
             # Calculate RMS after noise reduction
@@ -283,16 +387,28 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
             # Only save and send if gate is significantly open
             if gate_state > 0.1:
                 audio_buffer.append(gated_audio.tobytes())
-                # Save original audio (noise-reduced but not gated) for better quality
-                segment_bytes.append(reduced_noise.tobytes())
+                # Save ORIGINAL RAW audio (before noise reduction) for playback
+                # This ensures saved files are audible and not silent
+                segment_bytes.append(data_np.tobytes())
                 if not segment_active:
                     segment_active = True
                     segment_started_at = datetime.utcnow()
                 
+                # VISUALIZATION THRESHOLD: Only show waveform if gate is substantially open
+                # This prevents minor noise from cluttering the display while still detecting coughs
+                display_threshold = 0.3  # Show waveform only when gate is 30% or more open
+                
+                if gate_state >= display_threshold:
+                    # Show actual waveform for significant sounds
+                    display_waveform = gated_audio.tolist()
+                else:
+                    # Show minimal waveform for weak sounds (smooth visualization)
+                    display_waveform = (gated_audio * 0.2).astype(np.int16).tolist()
+                
                 # Send waveform data to the frontend
                 try:
                     await websocket.send_text(json.dumps({
-                        "waveform": gated_audio.tolist(),
+                        "waveform": display_waveform,
                         "rms": float(rms),
                         "db": float(db_level),
                         "gate_open": gate_state > 0.5,
@@ -332,7 +448,7 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
                         segment_bytes = []
                         segment_started_at = None  # Reset timer
                         duration_sec = len(raw_bytes) / (2 * RATE)
-                        if duration_sec >= 0.3:
+                        if duration_sec >= 0.2:  # Lower minimum duration for short weak coughs
                             tmp_path = router.media_dir / "_tmp_segment.wav"
                             data_i16 = np.frombuffer(raw_bytes, dtype=np.int16)
                             sf.write(str(tmp_path), data_i16.astype(np.int16), RATE, subtype='PCM_16')
@@ -348,12 +464,16 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
                             elif len(y) < target_length:
                                 y = np.pad(y, (0, target_length - len(y)))
 
+                            # ENHANCE AUDIO FOR ELDERLY DETECTION
+                            # Apply specialized enhancement before ML processing
+                            y_enhanced = enhance_audio_for_elderly(y, sr=router.target_sr)
+                            
                             if router.yamnet_model is None or router.cough_classifier is None or router.preprocessor is None:
                                 logging.warning(f"Skipping prediction: yamnet={router.yamnet_model is not None}, classifier={router.cough_classifier is not None}, preprocessor={router.preprocessor is not None}")
                                 continue
 
-                            logging.info(f"Processing audio segment: duration={duration_sec:.2f}s")
-                            waveform = tf.convert_to_tensor(y, dtype=tf.float32)
+                            logging.info(f"Processing audio segment: duration={duration_sec:.2f}s (enhanced)")
+                            waveform = tf.convert_to_tensor(y_enhanced, dtype=tf.float32)
                             
                             # Call YAMNet to get embeddings
                             try:
@@ -409,6 +529,25 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
                                 sidecar = {"timestamp": event["timestamp"], "probability": prob, "label": label, "media_url": event["media_url"], "username": username, "caretaker_id": (caretaker.id if caretaker else None), "recipient_id": (recipient.id if recipient else None), "age": meta_dict["age"], "gender": meta_dict["gender"], "respiratory_condition": meta_dict["respiratory_condition"]}
                                 with open(str(out_path.with_suffix('.json')), 'w', encoding='utf-8') as f:
                                     json.dump(sidecar, f)
+                                
+                                # Save to database
+                                try:
+                                    detection_data = {
+                                        "timestamp": segment_timestamp,
+                                        "probability": prob,
+                                        "label": label,
+                                        "media_url": event["media_url"],
+                                        "username": username,
+                                        "caretaker_id": caretaker.id if caretaker else None,
+                                        "recipient_id": recipient.id if recipient else None,
+                                        "age": meta_dict["age"],
+                                        "gender": meta_dict["gender"],
+                                        "respiratory_condition": meta_dict["respiratory_condition"]
+                                    }
+                                    cough_repo.create_cough_detection(db, detection_data)
+                                    logging.info(f"Cough detection saved to database: {segment_timestamp}")
+                                except Exception as db_error:
+                                    logging.error(f"Failed to save cough detection to database: {db_error}")
 
                             try:
                                 await websocket.send_text(json.dumps(event))
