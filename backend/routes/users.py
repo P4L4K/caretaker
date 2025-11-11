@@ -2,8 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from datetime import timedelta
 
-from models.users import ResponseSchema, Register, Login
-from models.token import Token
+from schemas.users import ResponseSchema, Register, Login
+from schemas.token import Token
 from tables.users import CareTaker, CareRecipient
 from config import get_db, ACCESS_TOKEN_EXPIRE_MINUTES
 from repository.users import UsersRepo, JWTRepo
