@@ -36,9 +36,12 @@ class JWTRepo:
     @staticmethod
     def decode_token(token: str):
         try:
+            if not token:
+                return None
             decoded_token = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
             if decoded_token.get("exp") and datetime.utcfromtimestamp(decoded_token["exp"]) < datetime.utcnow():
                 return None
             return decoded_token
-        except JWTError:
-            return {}
+        except JWTError as e:
+            print(f"JWT decode error: {e}")
+            return None

@@ -36,17 +36,23 @@ CHANNELS = 1
 FORMAT = pyaudio.paInt16
 WAVE_OUTPUT_FILENAME = "output.wav"
 
-# Noise gate parameters - HIGHLY OPTIMIZED FOR ELDERLY CARE
-# Designed for VERY QUIET elderly voices and weak coughs
-# Target sounds: weak coughs, snores, groans, breathing irregularities, falls, calls for help
-NOISE_GATE_THRESHOLD = -55  # dB threshold (VERY sensitive for weak elderly voices)
-SILENCE_THRESHOLD_RMS = 300  # MUCH lower for very quiet elderly sounds
-# CRITICAL: Fast attack for transient detection (coughs, falls)
-ATTACK_TIME = 0.003  # 3ms - Even faster to catch weak transients
-# Longer release to capture full weak coughs
-RELEASE_TIME = 0.25  # 250ms - Longer to capture complete weak coughs
-# Extended hold time for weak, labored breathing patterns
-HOLD_TIME = 0.15  # 150ms - Much longer hold for weak elderly speech
+# Audio processing configuration
+class AudioConfig:
+    """Audio processing configuration parameters"""
+    def __init__(self):
+        # Noise gate parameters - MODERATELY SENSITIVE
+        self.NOISE_GATE_THRESHOLD = -45  # dB threshold (moderately sensitive)
+        self.SILENCE_THRESHOLD_RMS = 150  # Balanced threshold for general use
+        self.ATTACK_TIME = 0.005  # 5ms - Standard attack time
+        self.RELEASE_TIME = 0.2  # 200ms - Standard release time
+        self.HOLD_TIME = 0.1  # 100ms - Standard hold time
+        self.CHUNK = 4096
+        self.RATE = 44100
+        self.CHANNELS = 1
+        self.FORMAT = pyaudio.paInt16
+
+# Global configuration
+audio_config = AudioConfig()
 
 router = APIRouter()
 p = pyaudio.PyAudio()
@@ -92,11 +98,84 @@ async def startup_event():
     router.max_segments = 30
     router.threshold = 0.5
 
-def calculate_db(rms):
+def calculate_db(rms, config=None):
     """Convert RMS to decibels."""
+    config = config or audio_config
     if rms <= 0:
         return -100
     return 20 * np.log10(rms / 32768.0)
+
+
+def get_audio_stream(config=None):
+    """Initialize and return an audio stream with the given configuration."""
+    config = config or audio_config
+    p = pyaudio.PyAudio()
+    return p.open(
+        format=audio_config.FORMAT,
+        channels=audio_config.CHANNELS,
+        rate=audio_config.RATE,
+        input=True,
+        frames_per_buffer=audio_config.CHUNK
+    )
+
+
+def process_audio_chunk(audio_data, gate_state, hold_counter, noise_floor_buffer, config=None):
+    """Process a single chunk of audio data.
+    
+    Args:
+        audio_data: Raw audio data from the stream
+        gate_state: Current state of the noise gate (0.0 to 1.0)
+        hold_counter: Current hold counter
+        noise_floor_buffer: Buffer for adaptive noise floor calculation
+        config: AudioConfig instance (optional)
+        
+    Returns:
+        Tuple of (processed_audio, gate_state, hold_counter, rms, db_level, adaptive_threshold)
+    """
+    config = config or audio_config
+    
+    # Convert to numpy array
+    data_np = np.frombuffer(audio_data, dtype=np.int16)
+    rms_raw = np.sqrt(np.mean(np.square(data_np.astype(np.float32))))
+    
+    # Adaptive noise floor
+    if rms_raw < config.SILENCE_THRESHOLD_RMS * 0.5:
+        noise_floor_buffer.append(rms_raw)
+        if len(noise_floor_buffer) > 100:
+            noise_floor_buffer.pop(0)
+    
+    if len(noise_floor_buffer) > 20:
+        adaptive_threshold = np.clip(
+            np.percentile(noise_floor_buffer, 75) * 1.2,
+            50,  # min threshold
+            500  # max threshold
+        )
+    else:
+        adaptive_threshold = 50
+    
+    # Noise reduction
+    reduced_noise = nr.reduce_noise(
+        y=data_np,
+        sr=config.RATE,
+        stationary=True,
+        prop_decrease=0.3
+    )
+    
+    rms = np.sqrt(np.mean(np.square(reduced_noise.astype(np.float32))))
+    
+    # Apply noise gate
+    gated_audio, gate_state, hold_counter = apply_noise_gate_with_hold(
+        reduced_noise, rms, gate_state, hold_counter,
+        attack_samples=max(1, int(config.ATTACK_TIME * config.RATE / config.CHUNK)),
+        release_samples=max(1, int(config.RELEASE_TIME * config.RATE / config.CHUNK)),
+        hold_samples=max(1, int(config.HOLD_TIME * config.RATE / config.CHUNK)),
+        adaptive_threshold=adaptive_threshold,
+        config=config
+    )
+    
+    db_level = calculate_db(rms, config)
+    
+    return gated_audio, gate_state, hold_counter, rms, db_level, adaptive_threshold
 
 def normalize_audio(audio, target_db=-20.0):
     """
@@ -230,16 +309,30 @@ def enhance_audio_for_elderly(y, sr=16000):
         return y
 
 def apply_noise_gate_with_hold(audio_data, rms, gate_state, hold_counter, 
-                                attack_samples, release_samples, hold_samples, adaptive_threshold):
+                                attack_samples, release_samples, hold_samples, 
+                                adaptive_threshold, config=None):
     """
     Apply noise gate with attack, hold, and release envelope.
-    Returns: (gated_audio, new_gate_state, new_hold_counter)
+    
+    Args:
+        audio_data: Input audio data
+        rms: RMS value of the audio
+        gate_state: Current state of the gate (0.0 to 1.0)
+        hold_counter: Current hold counter
+        attack_samples: Number of samples for attack phase
+        release_samples: Number of samples for release phase
+        hold_samples: Number of samples to hold the gate open
+        adaptive_threshold: Adaptive threshold for gate opening
+        config: AudioConfig instance (optional)
+        
+    Returns:
+        Tuple of (gated_audio, new_gate_state, new_hold_counter)
     """
-    db_level = calculate_db(rms)
+    config = config or audio_config
+    db_level = calculate_db(rms, config)
     
     # Determine if gate should be open
-    # Replace with adaptive threshold
-    gate_open = db_level > NOISE_GATE_THRESHOLD and rms > adaptive_threshold
+    gate_open = db_level > config.NOISE_GATE_THRESHOLD and rms > adaptive_threshold
     
     # Prevent division by zero
     attack_samples = max(1, attack_samples)
@@ -258,9 +351,8 @@ def apply_noise_gate_with_hold(audio_data, rms, gate_state, hold_counter,
         # Release phase - gate closing
         gate_state = max(0.0, gate_state - 1.0 / release_samples)
     
-    # Apply gate with smooth envelope
+    # Apply gate to audio
     gated_audio = audio_data * gate_state
-    
     return gated_audio.astype(np.int16), gate_state, hold_counter
 
 async def audio_stream(websocket: WebSocket, token: dict, db: Session):
@@ -304,14 +396,14 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
     segment_started_at = None
     max_segment_duration = 5.0  # Maximum segment duration in seconds before forcing processing
     
-    # Calculate timing in samples
-    attack_samples = max(1, int(ATTACK_TIME * RATE / CHUNK))
-    release_samples = max(1, int(RELEASE_TIME * RATE / CHUNK))
-    hold_samples = max(1, int(HOLD_TIME * RATE / CHUNK))  # NEW
+    # Calculate timing in samples using audio_config
+    attack_samples = max(1, int(audio_config.ATTACK_TIME * audio_config.RATE / audio_config.CHUNK))
+    release_samples = max(1, int(audio_config.RELEASE_TIME * audio_config.RATE / audio_config.CHUNK))
+    hold_samples = max(1, int(audio_config.HOLD_TIME * audio_config.RATE / audio_config.CHUNK))
     
     logging.info(f"Gate timing - Attack: {attack_samples}, Release: {release_samples}, Hold: {hold_samples}")
-    logging.info(f"Attack time: {ATTACK_TIME*1000:.1f}ms, Release: {RELEASE_TIME*1000:.1f}ms, Hold: {HOLD_TIME*1000:.1f}ms")
-    logging.info(f"Noise gate threshold: {NOISE_GATE_THRESHOLD} dB, RMS threshold: {SILENCE_THRESHOLD_RMS}")
+    logging.info(f"Attack time: {audio_config.ATTACK_TIME*1000:.1f}ms, Release: {audio_config.RELEASE_TIME*1000:.1f}ms, Hold: {audio_config.HOLD_TIME*1000:.1f}ms")
+    logging.info(f"Noise gate threshold: {audio_config.NOISE_GATE_THRESHOLD} dB, RMS threshold: {audio_config.SILENCE_THRESHOLD_RMS}")
     
     # Rolling buffer for adaptive noise floor estimation
     noise_floor_buffer = []
@@ -331,7 +423,7 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
                 logging.info("WebSocket connection check failed, stopping audio stream")
                 break
             
-            data = stream.read(CHUNK, exception_on_overflow=False)
+            data = stream.read(audio_config.CHUNK, exception_on_overflow=False)
             data_np = np.frombuffer(data, dtype=np.int16)
             
             # Calculate initial RMS
@@ -339,15 +431,15 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
             
             # Adaptive noise floor estimation - HIGHLY SENSITIVE FOR ELDERLY
             # Only update noise floor with VERY LOW values (ambient noise, not patient sounds)
-            if rms_raw < SILENCE_THRESHOLD_RMS * 0.5:  # Only track very quiet ambient noise
+            if rms_raw < audio_config.SILENCE_THRESHOLD_RMS * 0.5:  # Only track very quiet ambient noise
                 if len(noise_floor_buffer) >= noise_floor_size:
                     noise_floor_buffer.pop(0)
                 noise_floor_buffer.append(rms_raw)
             
-            # Calculate adaptive threshold - MORE SENSITIVE
-            if len(noise_floor_buffer) > 20:
+            # Calculate adaptive threshold - VERY LOW for elderly voices
+            if len(noise_floor_buffer) > 20:  # Need some samples for stability
                 adaptive_threshold = np.clip(
-                    np.percentile(noise_floor_buffer, 75) * 1.2,  # Lower percentile and multiplier
+                    np.percentile(noise_floor_buffer, 75) * 1.2,  # Use 75th percentile to ignore outliers
                     MIN_NOISE_THRESHOLD,
                     MAX_NOISE_THRESHOLD
                 )
@@ -358,7 +450,7 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
             # VERY GENTLE noise reduction to preserve weak elderly speech
             reduced_noise = nr.reduce_noise(
                 y=data_np, 
-                sr=RATE, 
+                sr=audio_config.RATE, 
                 stationary=True,
                 prop_decrease=0.3  # Much less aggressive to preserve very weak sounds
             )
@@ -369,7 +461,8 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
             # Apply noise gate with hold
             gated_audio, gate_state, hold_counter = apply_noise_gate_with_hold(
                 reduced_noise, rms, gate_state, hold_counter,
-                attack_samples, release_samples, hold_samples, adaptive_threshold
+                attack_samples, release_samples, hold_samples,
+                adaptive_threshold, config=audio_config
             )
             
             # Log audio levels for debugging (comment out after tuning)
@@ -447,11 +540,11 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
                         segment_active = False
                         segment_bytes = []
                         segment_started_at = None  # Reset timer
-                        duration_sec = len(raw_bytes) / (2 * RATE)
+                        duration_sec = len(raw_bytes) / (2 * audio_config.RATE)
                         if duration_sec >= 0.2:  # Lower minimum duration for short weak coughs
                             tmp_path = router.media_dir / "_tmp_segment.wav"
                             data_i16 = np.frombuffer(raw_bytes, dtype=np.int16)
-                            sf.write(str(tmp_path), data_i16.astype(np.int16), RATE, subtype='PCM_16')
+                            sf.write(str(tmp_path), data_i16.astype(np.int16), audio_config.RATE, subtype='PCM_16')
 
                             y, sr = librosa.load(str(tmp_path), sr=None, mono=True)
                             if sr != router.target_sr:
@@ -568,9 +661,9 @@ async def audio_stream(websocket: WebSocket, token: dict, db: Session):
         # Save the recorded audio
         if audio_buffer:
             wf = wave.open(WAVE_OUTPUT_FILENAME, 'wb')
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(p.get_sample_size(FORMAT))
-            wf.setframerate(RATE)
+            wf.setnchannels(audio_config.CHANNELS)
+            wf.setsampwidth(p.get_sample_size(audio_config.FORMAT))
+            wf.setframerate(audio_config.RATE)
             wf.writeframes(b''.join(audio_buffer))
             wf.close()
             logging.info(f"Audio saved to {WAVE_OUTPUT_FILENAME}")

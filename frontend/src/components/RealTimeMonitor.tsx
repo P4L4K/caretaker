@@ -43,7 +43,8 @@ const RealTimeMonitor: React.FC = () => {
   }, []);
 
   const connectWebSocket = () => {
-    const ws = new WebSocket('ws://localhost:8000/ws/process');
+    const token = localStorage.getItem('token');
+    const ws = new WebSocket(`ws://localhost:8000/ws/unified?token=${token}`);
     wsRef.current = ws;
 
     ws.onopen = () => {

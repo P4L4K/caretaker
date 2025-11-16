@@ -126,24 +126,27 @@ async def analyze_frame(file: UploadFile = File(...)):
         if frame is None:
             raise HTTPException(status_code=400, detail="Invalid image data")
 
-        dom, conf, _ = get_emotion_from_frame(
-            frame,
-            detector_backend="opencv",
-            enforce_detection=False,
-            align=True,
-            target_width=640,
-        )
-
-        fall_res = {"fall_detected": False, "timestamp": None}
-        if FALL_DETECTION_AVAILABLE and _fall_detector:
-            fall_res = _fall_detector.detect_fall(frame)
-            if fall_res.get("fall_detected"):
-                _append_fall_log(fall_res)
-
+        # Use the enhanced process_video_frame function from unified_stream
+        from .unified_stream import process_video_frame
+        import asyncio
+        
+        # Process the frame with our enhanced function
+        result = await process_video_frame(frame)
+        
+        # Log fall detection if detected
+        if result.get('fall_detected'):
+            fall_res = {
+                "fall_detected": True,
+                "timestamp": datetime.utcnow().isoformat(),
+                "angle": result.get('fall_angle', 0)
+            }
+            _append_fall_log(fall_res)
+        
         return JSONResponse({
-            "mood": dom or "neutral",
-            "fall_detected": bool(fall_res.get("fall_detected")),
-            "timestamp": fall_res.get("timestamp"),
+            "mood": result.get('emotion', 'neutral'),
+            "emotion_confidence": result.get('emotion_confidence', 0.0),
+            "fall_detected": bool(result.get('fall_detected', False)),
+            "timestamp": datetime.utcnow().isoformat(),
         })
     except HTTPException:
         raise

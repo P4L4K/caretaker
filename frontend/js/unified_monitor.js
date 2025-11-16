@@ -101,7 +101,7 @@ function connectMonitorWebSocket() {
     document.getElementById('audio-status-text').textContent = 'Connecting...';
     console.log('Connecting to unified monitoring WebSocket...');
     
-    monitorSocket = new WebSocket(`ws://localhost:8000/realtime/monitor?token=${token}`);
+    monitorSocket = new WebSocket(`ws://localhost:8000/ws/unified?token=${token}`);
     
     monitorSocket.onopen = () => {
         document.getElementById('audio-status-text').textContent = 'Active';

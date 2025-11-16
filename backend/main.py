@@ -12,7 +12,7 @@ from tables import cough_detections as cough_tables
 from routes import users as user_routes
 from routes import audio as audio_routes
 from routes import video as video_routes
-from routes import realtime_monitor
+from routes import unified_stream
 from routes import cough_stats
 
 
@@ -38,7 +38,7 @@ async def root():
 app.include_router(user_routes.router)
 app.include_router(audio_routes.router)
 app.include_router(video_routes.router)
-app.include_router(realtime_monitor.router)
+app.include_router(unified_stream.router)
 app.include_router(cough_stats.router)
 
 # Mount static media directory

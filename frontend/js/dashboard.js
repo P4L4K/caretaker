@@ -82,47 +82,108 @@ function switchSection(sectionName) {
 
 function connectAudioWebSocket() {
     if (audioSocket) {
-        console.log('Audio WebSocket already connected');
+        const state = audioSocket.readyState;
+        const stateStr = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][state] || state;
+        console.log(`Audio WebSocket already exists with state: ${stateStr}`);
         return;
     }
     
     const token = localStorage.getItem('token');
+    if (!token) {
+        console.error('No authentication token found');
+        return;
+    }
+    
     const statusDot = document.getElementById('audio-status-dot');
     const statusText = document.getElementById('audio-status-text');
 
     statusText.textContent = 'Connecting...';
-    console.log('Connecting audio WebSocket...');
+    console.log('Connecting to WebSocket endpoint: ws://localhost:8000/ws/unified');
 
-    audioSocket = new WebSocket(`ws://localhost:8000/ws/audio?token=${token}`);
+    try {
+        const wsUrl = `ws://localhost:8000/ws/unified?token=${encodeURIComponent(token)}`;
+        console.log('Creating WebSocket with URL:', wsUrl);
+        audioSocket = new WebSocket(wsUrl);
 
-    audioSocket.onopen = () => {
-        statusText.textContent = 'Connected';
-        statusDot.classList.add('connected');
-        console.log('Audio WebSocket connected');
-    };
+        audioSocket.onopen = (event) => {
+            console.log('WebSocket connection established successfully', event);
+            statusText.textContent = 'Connected';
+            statusDot.classList.add('connected');
+            
+            // Send a test message to verify the connection
+            audioSocket.send(JSON.stringify({
+                type: 'handshake',
+                message: 'Client connected',
+                timestamp: new Date().toISOString()
+            }));
+        };
+    } catch (error) {
+        console.error('Failed to create WebSocket:', error);
+        statusText.textContent = 'Connection failed';
+        statusDot.classList.remove('connected');
+        return;
+    }
 
     audioSocket.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (data.waveform) {
-            drawWaveform(data.waveform);
-            updateAudioLevels(data.rms, data.db);
-        }
-        if (data.event === 'prediction' && data.label === 'Cough') {
-            handleCoughDetection(data);
+        console.log('Received WebSocket message:', event.data);
+        try {
+            const data = JSON.parse(event.data);
+            console.log('Parsed WebSocket data:', data);
+            
+            // Handle different message types
+            if (data.type === 'debug') {
+                console.log('Server debug:', data.message);
+                return;
+            }
+            
+            if (data.waveform) {
+                drawWaveform(data.waveform);
+                updateAudioLevels(data.rms, data.db);
+            }
+            
+            if (data.event === 'prediction') {
+                console.log('Prediction received:', data);
+                if (data.label === 'Cough') {
+                    handleCoughDetection(data);
+                }
+            }
+        } catch (error) {
+            console.error('Error processing WebSocket message:', error, 'Raw data:', event.data);
         }
     };
 
-    audioSocket.onclose = () => {
+    audioSocket.onclose = (event) => {
+        console.log('WebSocket connection closed:', {
+            code: event.code,
+            reason: event.reason,
+            wasClean: event.wasClean
+        });
+        
         statusText.textContent = 'Disconnected';
         statusDot.classList.remove('connected');
+        
+        // Clear the socket reference
+        const oldSocket = audioSocket;
         audioSocket = null;
-        console.log('Audio WebSocket disconnected');
+        
+        // Attempt to reconnect after a delay if the closure was unexpected
+        if (!event.wasClean) {
+            console.log('Attempting to reconnect in 3 seconds...');
+            setTimeout(connectAudioWebSocket, 3000);
+        }
     };
 
     audioSocket.onerror = (error) => {
-        console.error('Audio WebSocket error:', error);
-        statusText.textContent = 'Error';
+        console.error('WebSocket error:', {
+            type: error.type,
+            message: error.message || 'Unknown WebSocket error',
+            timestamp: new Date().toISOString()
+        });
+        
+        statusText.textContent = 'Connection Error';
         statusDot.classList.remove('connected');
+        
+        // The socket will be closed after an error, so we'll rely on onclose to handle reconnection
     };
 }
 

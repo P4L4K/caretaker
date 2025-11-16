@@ -11,6 +11,7 @@ import pyaudio
 import noisereduce as nr
 import cv2
 import base64
+import time
 from datetime import datetime
 from pathlib import Path
 import soundfile as sf
@@ -20,40 +21,242 @@ import joblib
 import pandas as pd
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
 from sqlalchemy.orm import Session
-from typing import Optional
+from typing import Optional, Dict, Any, List, Tuple
 
+# Import from local modules
+from .audio import (
+    AudioConfig, audio_config, 
+    process_audio_chunk,
+    calculate_db,
+    normalize_audio,
+    get_audio_stream,
+    enhance_audio_for_elderly
+)
+from .video import (
+    get_emotion_from_frame,
+    FALL_DETECTION_AVAILABLE,
+    _fall_detector,
+    _VideoCaptureThread
+)
+
+# Import FallDetector directly to ensure it's available
+try:
+    from models.video.fall_detection import FallDetector
+    _fall_detector = FallDetector()
+    FALL_DETECTION_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Fall detection not available: {e}")
+    _fall_detector = None
+    FALL_DETECTION_AVAILABLE = False
+
+# Import from other modules
 from tables.users import CareTaker, CareRecipient
 from repository.users import UsersRepo, JWTRepo
 from repository.token_blocklist import TokenBlocklistRepo
 from repository import cough_detections as cough_repo
 from config import get_db
-from models.video.emotion_recognition import get_emotion_from_frame
-from models.video.fall_detection import FallDetector
 
-# Import enhancement function from audio.py
+import json
+import logging
+import os
 import sys
-sys.path.append(str(Path(__file__).parent))
-from audio import enhance_audio_for_elderly
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, Optional
 
-try:
-    from models.video.fall_detection import FallDetector
-    FALL_DETECTION_AVAILABLE = True
-except Exception as e:
-    logging.warning(f"Fall detection not available: {e}")
-    FALL_DETECTION_AVAILABLE = False
+# Create logs directory if it doesn't exist
+log_dir = Path(__file__).parent.parent / 'logs'
+log_dir.mkdir(exist_ok=True, parents=True)
 
-logging.basicConfig(level=logging.INFO)
+# Create a structured JSON log file with timestamp
+session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file = log_dir / f'detections_{session_id}.jsonl'  # JSON Lines format
 
-# Audio constants - HIGHLY OPTIMIZED FOR ELDERLY CARE
-CHUNK = 4096
-RATE = 44100
-CHANNELS = 1
-FORMAT = pyaudio.paInt16
-NOISE_GATE_THRESHOLD = -55  # VERY sensitive for weak elderly voices
-SILENCE_THRESHOLD_RMS = 300  # MUCH lower for very quiet elderly sounds
-ATTACK_TIME = 0.003  # Faster to catch weak transients
-RELEASE_TIME = 0.25  # Longer to capture complete weak coughs
-HOLD_TIME = 0.15  # Much longer hold for weak elderly speech
+class DetectionLogger:
+    _instance = None
+    
+    def __new__(cls, log_file: Path):
+        if cls._instance is None:
+            cls._instance = super(DetectionLogger, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self, log_file: Path):
+        if self._initialized:
+            return
+            
+        self.log_file = log_file
+        self._initialized = True
+        
+        print(f"[DEBUG] Initializing logger with file: {log_file}")
+        print(f"[DEBUG] Log directory exists: {log_file.parent.exists()}")
+        print(f"[DEBUG] Log directory writable: {os.access(str(log_file.parent), os.W_OK)}")
+        
+        # Create a dedicated logger for detections
+        self.logger = logging.getLogger('caretaker.detections')
+        self.logger.setLevel(logging.INFO)
+        
+        # Remove any existing handlers to avoid duplicates
+        if self.logger.handlers:
+            self.logger.handlers.clear()
+            
+        # Ensure the log directory exists
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Create file handler
+        try:
+            file_handler = logging.FileHandler(str(log_file.absolute()), mode='a', encoding='utf-8')
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(logging.Formatter('%(message)s'))
+            self.logger.addHandler(file_handler)
+            print(f"[DEBUG] File handler added to logger")
+        except Exception as e:
+            print(f"[ERROR] Failed to create file handler: {e}")
+            
+        # Also log to console for debugging
+        console = logging.StreamHandler()
+        console.setLevel(logging.DEBUG)
+        console.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        self.logger.addHandler(console)
+        
+        # Test logging
+        self.logger.info("Logger initialized successfully")
+        print(f"[DEBUG] Logger initialization complete")
+        
+        # Prevent adding handlers multiple times
+        if not self.logger.handlers:
+            # File handler for JSON logs
+            try:
+                file_handler = logging.FileHandler(
+                    str(log_file.absolute()),
+                    mode='a',
+                    encoding='utf-8',
+                    delay=False
+                )
+                file_handler.setFormatter(logging.Formatter('%(message)s'))
+                self.logger.addHandler(file_handler)
+                
+                # Console handler for human-readable logs
+                console = logging.StreamHandler(sys.stdout)
+                console.setFormatter(logging.Formatter(
+                    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+                ))
+                self.logger.addHandler(console)
+                
+                # Log the start of the session
+                self.logger.info(json.dumps({
+                    'timestamp': datetime.utcnow().isoformat() + 'Z',
+                    'level': 'INFO',
+                    'message': f'Detection logging started',
+                    'session_id': session_id,
+                    'log_file': str(log_file.absolute())
+                }, default=str))
+                
+            except Exception as e:
+                # Fallback to console if file logging fails
+                print(f"Failed to initialize file logging: {e}", file=sys.stderr)
+                console = logging.StreamHandler()
+                console.setFormatter(logging.Formatter('%(message)s'))
+                self.logger.addHandler(console)
+                self.logger.error(f"Failed to initialize file logging: {e}")
+        
+        # Make sure the file is writable
+        try:
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write('')  # Test write
+        except Exception as e:
+            self.logger.error(f"Log file is not writable: {e}")
+            raise
+    
+    def log_detection(
+        self,
+        detection_type: str,  # 'cough', 'fall', 'emotion'
+        prediction: Dict[str, Any],
+        user_id: Optional[str] = None,
+        processing_time_ms: Optional[float] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        # Debug log to confirm the method is being called
+        print(f"[DEBUG] Logging detection - Type: {detection_type}, User: {user_id}")
+        print(f"[DEBUG] Log file: {self.log_file}")
+        print(f"[DEBUG] Handlers: {self.logger.handlers}")
+        try:
+            print(f"[DEBUG] Log file exists: {self.log_file.exists()}")
+            print(f"[DEBUG] Log file writable: {os.access(str(self.log_file), os.W_OK)}")
+        except Exception as e:
+            print(f"[DEBUG] Error checking log file: {e}")
+        """
+        Log a detection event with structured data.
+        
+        Args:
+            detection_type: Type of detection ('cough', 'fall', 'emotion')
+            prediction: Dictionary containing prediction details
+            user_id: Optional user ID
+            processing_time_ms: Optional processing time in milliseconds
+            metadata: Additional metadata to include in the log
+        """
+        try:
+            # Create log entry with all required fields
+            log_entry = {
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'session_id': session_id,
+                'detection_type': detection_type,
+                'level': 'INFO',
+                'user_id': user_id,
+                'processing_time_ms': round(processing_time_ms, 3) if processing_time_ms is not None else None,
+                'prediction': prediction,
+                'metadata': metadata or {}
+            }
+            
+            # Convert to JSON string
+            log_line = json.dumps(log_entry, default=str)
+            
+            # Log to file and console
+            self.logger.info(log_line)
+            
+            # Force flush to ensure logs are written immediately
+            for handler in self.logger.handlers:
+                handler.flush()
+                
+        except Exception as e:
+            # If JSON serialization fails, log the error with traceback
+            error_msg = f"Failed to log detection: {str(e)}"
+            print(f"ERROR: {error_msg}", file=sys.stderr)
+            self.logger.error(error_msg, exc_info=True)
+            
+            # Try to log a simplified version
+            try:
+                safe_entry = {
+                    'timestamp': datetime.utcnow().isoformat() + 'Z',
+                    'session_id': session_id,
+                    'level': 'ERROR',
+                    'error': 'Failed to serialize detection',
+                    'detection_type': str(detection_type)[:100],
+                    'user_id': str(user_id)[:100] if user_id else None
+                }
+                self.logger.error(json.dumps(safe_entry))
+            except:
+                # Last resort - log a simple message
+                self.logger.error(f"[{datetime.utcnow().isoformat()}Z] Failed to log detection")
+
+# Initialize the detection logger
+print("[DEBUG] Initializing detection logger...")
+detection_logger = DetectionLogger(log_file)
+print("[DEBUG] Detection logger initialized")
+
+# Configure basic logging for other purposes
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+# Use audio configuration from audio.py
+audio_cfg = AudioConfig()
+
+# Video capture thread
+_video_capture = _VideoCaptureThread()
 
 router = APIRouter()
 
@@ -116,57 +319,12 @@ async def startup_event():
     router.threshold = 0.5
 
 
-def calculate_db(rms):
-    """Convert RMS to decibels"""
-    if rms <= 0:
-        return -100
-    return 20 * np.log10(rms / 32768.0)
-
-
-def normalize_audio(audio, target_db=-20.0):
-    """Normalize audio to target dB level"""
-    rms = np.sqrt(np.mean(np.square(audio.astype(np.float32))))
-    if rms < 1e-6:
-        return audio
-    
-    current_db = 20 * np.log10(rms / 32768.0)
-    gain_db = target_db - current_db
-    gain_linear = 10 ** (gain_db / 20.0)
-    
-    normalized = audio.astype(np.float32) * gain_linear
-    normalized = np.clip(normalized, -32768, 32767)
-    
-    return normalized.astype(np.int16)
-
-
-def apply_noise_gate_with_hold(audio_data, rms, gate_state, hold_counter, 
-                                attack_samples, release_samples, hold_samples, adaptive_threshold):
-    """Apply noise gate with attack, hold, and release envelope"""
-    db_level = calculate_db(rms)
-    gate_open = db_level > NOISE_GATE_THRESHOLD and rms > adaptive_threshold
-    
-    attack_samples = max(1, attack_samples)
-    release_samples = max(1, release_samples)
-    
-    if gate_open:
-        gate_state = min(1.0, gate_state + 1.0 / attack_samples)
-        hold_counter = hold_samples
-    elif hold_counter > 0:
-        gate_state = 1.0
-        hold_counter -= 1
-    elif gate_state > 0.0:
-        gate_state = max(0.0, gate_state - 1.0 / release_samples)
-    
-    gated_audio = audio_data * gate_state
-    return gated_audio.astype(np.int16), gate_state, hold_counter
-
-
 async def process_audio_chunk(audio_data, meta_dict):
     """Process audio chunk for cough detection"""
     try:
         tmp_path = router.media_dir / "_tmp_segment.wav"
         data_i16 = np.frombuffer(audio_data, dtype=np.int16)
-        sf.write(str(tmp_path), data_i16.astype(np.int16), RATE, subtype='PCM_16')
+        sf.write(str(tmp_path), data_i16.astype(np.int16), audio_cfg.RATE, subtype='PCM_16')
 
         y, sr = librosa.load(str(tmp_path), sr=None, mono=True)
         if sr != router.target_sr:
@@ -219,33 +377,125 @@ async def process_video_frame(frame):
         result = {}
         
         # Emotion detection
-        dom, conf, _ = get_emotion_from_frame(
-            frame,
-            detector_backend="opencv",
-            enforce_detection=False,
-            align=True,
-            target_width=640,
-        )
-        result['emotion'] = dom or "neutral"
-        result['emotion_confidence'] = conf
+        print("[DEBUG] Starting emotion detection...")
+        try:
+            dom, conf, all_emotions = get_emotion_from_frame(
+                frame,
+                detector_backend="opencv",
+                enforce_detection=False,
+                align=True,
+                target_width=640,
+            )
+            print(f"[DEBUG] Emotion detection result - emotion: {dom}, confidence: {conf}")
+            if all_emotions:
+                print(f"[DEBUG] All emotions: {all_emotions}")
+            
+            result['emotion'] = dom or "neutral"
+            result['emotion_confidence'] = float(conf) if conf is not None else 0.0
+            result['all_emotions'] = all_emotions
+            
+        except Exception as e:
+            print(f"[ERROR] Error in emotion detection: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            result['emotion'] = "error"
+            result['emotion_confidence'] = 0.0
+            result['emotion_error'] = str(e)
+        
+        # Log emotion detection if confidence is above threshold (lowered to 0.1 to capture more events)
+        emotion_confidence_threshold = 0.1  # Lowered threshold to capture more emotion detections
+        print(f"[DEBUG] Checking emotion confidence: {conf} (threshold: {emotion_confidence_threshold})")
+        if conf is not None and conf >= emotion_confidence_threshold:
+            print(f"[DEBUG] Emotion detected: {dom} (confidence: {conf:.2f})")
+            try:
+                detection_logger.log_detection(
+                    detection_type="emotion",
+                    prediction={
+                        "emotion": dom,
+                        "confidence": float(conf),
+                        "all_emotions": _  # This would contain the full emotion distribution if available
+                    },
+                    user_id=None,  # Add user ID if available
+                    processing_time_ms=0,  # Add actual processing time if available
+                    metadata={
+                        "timestamp": datetime.utcnow().isoformat() + 'Z',
+                        "detection_type": "emotion"
+                    }
+                )
+                print("[DEBUG] Emotion detection logged successfully")
+            except Exception as e:
+                print(f"[ERROR] Failed to log emotion detection: {e}")
+                import traceback
+                traceback.print_exc()
         
         # Fall detection
         fall_res = {"fall_detected": False, "timestamp": None}
         if FALL_DETECTION_AVAILABLE and _models['fall_detector']:
+            print("[DEBUG] Running fall detection...")
             fall_res = _models['fall_detector'].detect_fall(frame)
+            print(f"[DEBUG] Fall detection result: {fall_res}")
+        else:
+            print(f"[DEBUG] Fall detection not available or not loaded. Available: {FALL_DETECTION_AVAILABLE}, Detector: {'loaded' if _models.get('fall_detector') else 'not loaded'}")
         
         result['fall_detected'] = bool(fall_res.get("fall_detected"))
         result['fall_timestamp'] = fall_res.get("timestamp")
         
+        # Log fall detection if detected
+        if result['fall_detected']:
+            print(f"[DEBUG] Fall detected! Logging detection...")
+            try:
+                detection_logger.log_detection(
+                    detection_type="fall",
+                    prediction={"confidence": 1.0, "angle": fall_res.get("angle", 0)},
+                    user_id=None,  # Add user ID if available
+                    processing_time_ms=0,  # Add actual processing time if available
+                    metadata={"timestamp": str(fall_res.get("timestamp"))}
+                )
+                print("[DEBUG] Fall detection logged successfully")
+            except Exception as e:
+                print(f"[ERROR] Failed to log fall detection: {e}")
+                import traceback
+                traceback.print_exc()
+        
         return result
     except Exception as e:
-        logging.error(f"Video processing error: {e}", exc_info=True)
+        error_msg = f"Video processing error: {str(e)}"
+        print(f"[ERROR] {error_msg}")
+        logging.error(error_msg, exc_info=True)
+        
+        # Log the error to the detection log as well
+        try:
+            detection_logger.log_detection(
+                detection_type="error",
+                prediction={"error": str(e), "type": "video_processing"},
+                metadata={
+                    "timestamp": datetime.utcnow().isoformat() + 'Z',
+                    "error_type": "video_processing"
+                }
+            )
+        except Exception as log_error:
+            print(f"[ERROR] Failed to log video processing error: {log_error}")
+            
         return None
 
 
 async def unified_stream_handler(websocket: WebSocket, token: dict, db: Session):
     """Handle unified audio and video streaming"""
-    p = pyaudio.PyAudio()
+    print("[HANDLER] Starting unified stream handler")
+    
+    # Set to track if we're shutting down
+    is_shutting_down = False
+    
+    # Initialize PyAudio
+    print("[AUDIO] Initializing PyAudio...")
+    p = None
+    try:
+        p = pyaudio.PyAudio()
+        print("[AUDIO] PyAudio initialized")
+    except Exception as e:
+        print(f"[AUDIO] Failed to initialize PyAudio: {e}")
+        await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
+        return
     
     # Extract user metadata
     username = token.get("sub")
@@ -262,10 +512,22 @@ async def unified_stream_handler(websocket: WebSocket, token: dict, db: Session)
     
     logging.info(f"Unified stream started for user: {username}")
     
-    # Setup audio stream
-    stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
-                    input=True, frames_per_buffer=CHUNK)
-    
+    # Initialize audio stream
+    print(f"[AUDIO] Opening audio stream with format={audio_cfg.FORMAT}, channels={audio_cfg.CHANNELS}, rate={audio_cfg.RATE}, chunk={audio_cfg.CHUNK}")
+    try:
+        stream = p.open(
+            format=audio_cfg.FORMAT,
+            channels=audio_cfg.CHANNELS,
+            rate=audio_cfg.RATE,
+            input=True,
+            frames_per_buffer=audio_cfg.CHUNK
+        )
+        print("[AUDIO] Audio stream opened successfully")
+    except Exception as e:
+        print(f"[AUDIO] Failed to open audio stream: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
     await websocket.accept()
     logging.info("Unified WebSocket connection accepted")
     
@@ -278,9 +540,9 @@ async def unified_stream_handler(websocket: WebSocket, token: dict, db: Session)
     segment_started_at = None
     max_segment_duration = 5.0
     
-    attack_samples = max(1, int(ATTACK_TIME * RATE / CHUNK))
-    release_samples = max(1, int(RELEASE_TIME * RATE / CHUNK))
-    hold_samples = max(1, int(HOLD_TIME * RATE / CHUNK))
+    attack_samples = max(1, int(ATTACK_TIME * audio_cfg.RATE / audio_cfg.CHUNK))
+    release_samples = max(1, int(RELEASE_TIME * audio_cfg.RATE / audio_cfg.CHUNK))
+    hold_samples = max(1, int(HOLD_TIME * audio_cfg.RATE / audio_cfg.CHUNK))
     
     noise_floor_buffer = []
     noise_floor_size = 100
@@ -291,29 +553,75 @@ async def unified_stream_handler(websocket: WebSocket, token: dict, db: Session)
     video_frame_buffer = None
     last_video_process_time = datetime.now()
     video_process_interval = 1.5  # Process video every 1.5 seconds
+    # Main processing loop
+    print("[HANDLER] Entering main processing loop")
+    loop_count = 0
     
     try:
         while True:
-            # Check connection
+            loop_count += 1
+            if loop_count % 100 == 0:  # Log every 100 iterations to avoid flooding
+                print(f"[HANDLER] Processing loop iteration {loop_count}")
+            
+            # Check for incoming WebSocket messages
             try:
-                if websocket.client_state.name != "CONNECTED":
-                    logging.info("WebSocket disconnected")
-                    break
-            except Exception:
-                logging.info("WebSocket connection check failed")
+                # Set a short timeout to avoid blocking
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+                try:
+                    message = json.loads(data)
+                    print(f"[WEBSOCKET] Received message: {message}")
+                    
+                    # Handle handshake message
+                    if message.get('type') == 'handshake':
+                        print(f"[WEBSOCKET] Handshake received from client: {message.get('message')}")
+                        await websocket.send_json({
+                            'type': 'handshake_ack',
+                            'message': 'Server acknowledged',
+                            'timestamp': datetime.utcnow().isoformat() + 'Z'
+                        })
+                        continue
+                        
+                except json.JSONDecodeError:
+                    print(f"[WEBSOCKET] Received non-JSON message: {data}")
+                    
+            except asyncio.TimeoutError:
+                # No message received, continue with audio processing
+                pass
+            except Exception as e:
+                print(f"[WEBSOCKET] Error receiving message: {e}")
                 break
             
-            # === AUDIO PROCESSING ===
-            data = stream.read(CHUNK, exception_on_overflow=False)
-            data_np = np.frombuffer(data, dtype=np.int16)
-            
-            rms_raw = np.sqrt(np.mean(np.square(data_np.astype(np.float32))))
-            
-            # Adaptive noise floor - HIGHLY SENSITIVE FOR ELDERLY
-            if rms_raw < SILENCE_THRESHOLD_RMS * 0.5:  # Only track very quiet ambient noise
-                if len(noise_floor_buffer) >= noise_floor_size:
-                    noise_floor_buffer.pop(0)
-                noise_floor_buffer.append(rms_raw)
+            # Check if WebSocket is still connected
+            try:
+                if websocket.client_state.name != "CONNECTED":
+                    print("[HANDLER] WebSocket disconnected, stopping stream")
+                    logging.info("WebSocket disconnected, stopping stream")
+                    break
+            except Exception as e:
+                print(f"[HANDLER] WebSocket connection check failed: {e}")
+                logging.error(f"WebSocket connection check failed: {e}")
+                break
+            # Process audio data
+            try:
+                data = stream.read(audio_cfg.CHUNK, exception_on_overflow=False)
+                # Send audio data back to client for visualization
+                if loop_count % 10 == 0:  # Don't flood the WebSocket
+                    await websocket.send_json({
+                        'type': 'audio_data',
+                        'timestamp': datetime.utcnow().isoformat() + 'Z'
+                    })
+            except Exception as e:
+                print(f"[AUDIO] Error reading from audio stream: {e}")
+                break
+                data_np = np.frombuffer(data, dtype=np.int16)
+                
+                rms_raw = np.sqrt(np.mean(np.square(data_np.astype(np.float32))))
+                
+                # Adaptive noise floor - HIGHLY SENSITIVE FOR ELDERLY
+                if rms_raw < audio_cfg.SILENCE_THRESHOLD_RMS * 0.5:  # Only track very quiet ambient noise
+                    if len(noise_floor_buffer) >= noise_floor_size:
+                        noise_floor_buffer.pop(0)
+                    noise_floor_buffer.append(rms_raw)
             
             if len(noise_floor_buffer) > 20:
                 adaptive_threshold = np.clip(
@@ -325,20 +633,35 @@ async def unified_stream_handler(websocket: WebSocket, token: dict, db: Session)
                 adaptive_threshold = MIN_NOISE_THRESHOLD
             
             # Noise reduction - VERY GENTLE for weak elderly sounds
-            reduced_noise = nr.reduce_noise(
-                y=data_np, 
-                sr=RATE, 
-                stationary=True,
-                prop_decrease=0.3  # Much less aggressive
-            )
-            
-            rms = np.sqrt(np.mean(np.square(reduced_noise.astype(np.float32))))
+            try:
+                reduced_noise = nr.reduce_noise(
+                    y=data_np, 
+                    sr=audio_cfg.RATE, 
+                    stationary=True,
+                    prop_decrease=0.3  # Much less aggressive
+                )
+                
+                rms = np.sqrt(np.mean(np.square(reduced_noise.astype(np.float32))))
+            except Exception as e:
+                print(f"[AUDIO] Error in noise reduction: {e}")
+                rms = rms_raw  # Fall back to raw RMS if noise reduction fails
             
             # Apply noise gate
-            gated_audio, gate_state, hold_counter = apply_noise_gate_with_hold(
-                reduced_noise, rms, gate_state, hold_counter,
-                attack_samples, release_samples, hold_samples, adaptive_threshold
-            )
+            try:
+                gated_audio, gate_state, hold_counter = apply_noise_gate_with_hold(
+                    reduced_audio=reduced_noise,
+                    rms=rms,
+                    gate_state=gate_state,
+                    hold_counter=hold_counter,
+                    attack_samples=attack_samples,
+                    release_samples=release_samples,
+                    hold_samples=hold_samples,
+                    adaptive_threshold=adaptive_threshold,
+                    audio_config=audio_cfg
+                )
+            except Exception as e:
+                print(f"[AUDIO] Error in noise gate: {e}")
+                gated_audio = reduced_noise  # Bypass noise gate on error
             
             db_level = calculate_db(rms)
             
@@ -388,21 +711,85 @@ async def unified_stream_handler(websocket: WebSocket, token: dict, db: Session)
                 segment_active = False
                 segment_bytes = []
                 segment_started_at = None
-                duration_sec = len(raw_bytes) / (2 * RATE)
+                duration_sec = len(raw_bytes) / (2 * audio_cfg.RATE)
                 
                 if duration_sec >= 0.3:
-                    # Process audio in background
-                    audio_result = await process_audio_chunk(raw_bytes, meta_dict)
+                    # Process audio in background with timing
+                    print("[AUDIO] Processing audio chunk...")
+                    start_time = time.time()
+                    try:
+                        audio_result = await process_audio_chunk(raw_bytes, meta_dict)
+                        processing_time = (time.time() - start_time) * 1000
+                        print(f"[AUDIO] Processing completed in {processing_time:.2f}ms")
+                        
+                        # Send detection result to client
+                        if audio_result and 'label' in audio_result:
+                            await websocket.send_json({
+                                'type': 'detection',
+                                'event': 'prediction',
+                                'label': audio_result['label'],
+                                'probability': float(audio_result.get('probability', 0.0)),
+                                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                                'processing_time_ms': processing_time
+                            })
+                            
+                    except Exception as e:
+                        print(f"[AUDIO] Error processing audio: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        audio_result = None
+                        processing_time = 0
+                    
+                    if audio_result and 'label' in audio_result:
+                        print(f"[AUDIO] Audio result: {audio_result}")
+                        if audio_result['label'] == 'Cough':
+                            print(f"[AUDIO] Cough detected! Logging for user {username}")
+                            try:
+                                detection_logger.log_detection(
+                                    detection_type="cough",
+                                    prediction={"label": audio_result['label'], "probability": float(audio_result.get('probability', 0.0))},
+                                    user_id=username,
+                                    processing_time_ms=processing_time,
+                                    metadata={"media_url": ""}
+                                )
+                                print("[AUDIO] Successfully logged cough detection")
+                            except Exception as e:
+                                print(f"[AUDIO] Failed to log detection: {e}")
+                                import traceback
+                                traceback.print_exc()
+                        else:
+                            print(f"[AUDIO] No cough detected (label: {audio_result['label']})")
+                    else:
+                        print("[AUDIO] No valid audio result to process")
                     
                     if audio_result and audio_result['label'] == 'Cough':
                         prob = audio_result['probability']
-                        y = audio_result['y']
-                        sr = audio_result['sr']
+                        y = audio_result.get('y')
+                        sr = audio_result.get('sr')
                         
-                        # Save cough audio
-                        ts = segment_timestamp.strftime("%Y%m%dT%H%M%S%fZ")
-                        out_path = router.media_dir / f"cough_{ts}.wav"
-                        y_int16 = (y * 32768).astype(np.int16)
+                        # Save cough audio if we have the raw audio data
+                        if y is not None and sr is not None:
+                            try:
+                                ts = segment_timestamp.strftime("%Y%m%dT%H%M%S%fZ")
+                                out_path = router.media_dir / f"cough_{ts}.wav"
+                                y_int16 = (y * 32768).astype(np.int16)
+                                
+                                # Ensure media directory exists
+                                os.makedirs(router.media_dir, exist_ok=True)
+                                
+                                # Save the audio file
+                                sf.write(str(out_path), y_int16, int(sr), 'PCM_16')
+                                print(f"[AUDIO] Saved cough audio to {out_path}")
+                                
+                                # Update the detection with the media URL
+                                media_url = f"/media/{out_path.name}"
+                                
+                            except Exception as e:
+                                print(f"[AUDIO] Error saving cough audio: {e}")
+                                media_url = ""
+                        else:
+                            media_url = ""
+                            print("[AUDIO] No audio data to save for this detection")
                         y_normalized = normalize_audio(y_int16, target_db=-20.0)
                         sf.write(str(out_path), y_normalized, sr, subtype='PCM_16')
                         
@@ -458,40 +845,68 @@ async def unified_stream_handler(websocket: WebSocket, token: dict, db: Session)
             # Small delay to prevent CPU overload
             await asyncio.sleep(0.001)
     
+    except asyncio.CancelledError:
+        # Handle graceful shutdown
+        is_shutting_down = True
+        print("[HANDLER] Received cancellation signal, shutting down...")
+        raise
     except WebSocketDisconnect:
-        logging.info("WebSocket disconnected")
+        if not is_shutting_down:
+            logging.info("WebSocket disconnected by client")
     except Exception as e:
-        logging.error(f"Unified stream error: {e}", exc_info=True)
+        if not is_shutting_down:
+            logging.error(f"Unified stream error: {e}", exc_info=True)
     finally:
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
+        # Cleanup resources
+        print("[HANDLER] Cleaning up resources...")
+        try:
+            if 'stream' in locals() and stream.is_active():
+                stream.stop_stream()
+                stream.close()
+                print("[AUDIO] Audio stream closed")
+        except Exception as e:
+            print(f"[ERROR] Error closing audio stream: {e}")
+            
+        try:
+            if 'p' in locals():
+                p.terminate()
+                print("[AUDIO] PyAudio terminated")
+        except Exception as e:
+            print(f"[ERROR] Error terminating PyAudio: {e}")
+            
+        print("[HANDLER] Cleanup complete")
 
 
 async def get_token(websocket: WebSocket, db: Session = Depends(get_db)):
     """Validate WebSocket token"""
-    token = websocket.query_params.get("token")
-    if token is None:
-        raise WebSocketDisconnect(code=403, reason="Token not provided")
-    
-    if TokenBlocklistRepo.is_token_blocklisted(db, token):
-        raise WebSocketDisconnect(code=403, reason="Token has been blocklisted")
-
-    decoded_token = JWTRepo.decode_token(token)
-    if not decoded_token:
-        raise WebSocketDisconnect(code=403, reason="Invalid token")
-    
-    return decoded_token
-
-
-@router.websocket("/ws/unified")
-async def unified_websocket_endpoint(websocket: WebSocket, db: Session = Depends(get_db)):
-    """Unified WebSocket endpoint for simultaneous audio and video streaming"""
     try:
-        token = await get_token(websocket, db)
-        await unified_stream_handler(websocket, token, db)
-    except WebSocketDisconnect as e:
-        logging.info(f"WebSocket disconnected: {e.reason}")
+        # Get token from query parameters
+        token = websocket.query_params.get("token")
+        logger.info(f"Received token: {token}")
+        
+        if not token:
+            logger.error("No token provided")
+            raise WebSocketDisconnect(code=403, reason="Token not provided")
+        
+        # Check if token is blocklisted
+        if TokenBlocklistRepo.is_token_blocklisted(db, token):
+            logger.error("Token is blocklisted")
+            raise WebSocketDisconnect(code=403, reason="Token has been blocklisted")
+
+        # Decode and validate token
+        decoded_token = JWTRepo.decode_token(token)
+        logger.info(f"Decoded token: {decoded_token}")
+        
+        if not decoded_token:
+            logger.error("Failed to decode token")
+            raise WebSocketDisconnect(code=403, reason="Invalid token")
+        
+        return decoded_token
+        
+    except Exception as e:
+        logger.error(f"Token validation error: {str(e)}", exc_info=True)
+        raise WebSocketDisconnect(code=403, reason=f"Token validation failed: {str(e)}")
+
 
 
 @router.post("/video-frame")
